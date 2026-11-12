@@ -126,7 +126,7 @@ switch (cmd) {
 		break;
 	case "update":
 	case "upgrade": {
-		const { checkForUpdate, downloadFile, replaceSelfExecutable, canReplaceSelf, RELEASES_PAGE } = await import("../lib/update.mjs");
+		const { checkForUpdate, downloadFile, replaceSelfExecutable, canReplaceSelf, detectInstallType, RELEASES_PAGE } = await import("../lib/update.mjs");
 		const doDownload = argv.includes("--download") || argv.includes("-d") || argv.includes("--yes") || argv.includes("-y");
 		console.log("正在检查 GitHub Release 最新版本...");
 		const info = await checkForUpdate({ force: true });
@@ -136,7 +136,8 @@ switch (cmd) {
 			process.exitCode = 1;
 			break;
 		}
-		console.log(`当前运行版本：v${info.current}`);
+		const installType = detectInstallType();
+		console.log(`当前运行版本：v${info.current}（安装形态：${installType}）`);
 		if (info.published === false) {
 			console.log("尚无公开 Release；这不表示 npm 已是最新版。npm 安装可运行 npm outdated -g agent-purge。");
 			break;
@@ -151,6 +152,35 @@ switch (cmd) {
 			console.log(`\n【更新说明】\n${info.body.trim().slice(0, 500)}${info.body.length > 500 ? "..." : ""}`);
 		}
 
+		// 源码检出：更新就是这个目录里的 git pull，不走发布产物
+		if (installType === "git") {
+			const { gitCheckoutState, gitPullSelf } = await import("../lib/update.mjs");
+			const state = gitCheckoutState();
+			if (!state.ok) {
+				console.log(`\n✗ ${state.reason}`);
+				break;
+			}
+			console.log(`\n当前分支：${state.branch}${state.upstream ? ` → ${state.upstream}` : "（无上游）"}`);
+			if (state.dirty) {
+				console.log(`✗ 工作区有 ${state.dirty} 处未提交改动，先提交或撤销再更新。`);
+				process.exitCode = 1;
+				break;
+			}
+			if (!doDownload) {
+				console.log(`  · 在安装目录快进更新：\n     agent-purge update --download`);
+				break;
+			}
+			console.log("\n正在 git pull --ff-only...");
+			try {
+				const r = gitPullSelf();
+				if (r.output) console.log(`\n${r.output}`);
+				console.log(r.changed ? `✓ 已从 ${r.before} 快进到 ${r.after}。重启 agent-purge 生效。` : `✓ 已在 ${r.after}，没有新提交。`);
+			} catch (error) {
+				console.log(`✗ ${error.message}`);
+				process.exitCode = 1;
+			}
+			break;
+		}
 		const isExe = canReplaceSelf();
 		const targetExeAsset = info.assets?.find((a) => a.name.toLowerCase() === "agent-purge.exe");
 		const targetSetupAsset = info.assets?.find((a) => a.name.toLowerCase().endsWith("-setup.exe"));
@@ -708,10 +738,26 @@ async function webCmd(options = {}) {
 	const autoExit = options.autoExit ?? (argv.includes("--auto-exit") || (isCompiled() && !argv.includes("--no-auto-exit")));
 	const url = `http://127.0.0.1:${port}`;
 	const { openAppWindow } = await import("../lib/window.mjs");
+	const probeAlive = async () => {
+		try {
+			const res = await fetch(`${url}/api/state`, { signal: AbortSignal.timeout(1500) });
+			if (!res.ok) return false;
+			const data = await res.json().catch(() => null);
+			return Boolean(data && typeof data === "object" && ("version" in data || "personas" in data));
+		} catch { return false; }
+	};
 
 	// --detach：脱离当前终端后台存活，日志丢弃
 	if (argv.includes("--detach")) {
 		if (port === 0) die("--detach 需要明确端口；随机端口请用前台 web --port 0 --no-open");
+		if (await probeAlive()) {
+			console.log(`agent-purge 后台服务已在运行 → ${url}`);
+			if (!noOpen) {
+				const res = openAppWindow(url);
+				if (res.mode === "app") console.log(`已启动独立桌面窗口（${res.browser}）`);
+			}
+			process.exit(0);
+		}
 		// 源码态 execPath 是 node，得连脚本路径一起给；编译态 execPath 就是 exe 本体
 		const serveArgs = ["--serve", String(port)];
 		if (autoExit) serveArgs.push("--auto-exit");
@@ -732,7 +778,28 @@ async function webCmd(options = {}) {
 		process.exit(0);
 	}
 
-	const server = serveWeb(port, { autoExit });
+	const onServerError = async (e) => {
+		// 端口被占时（如桌面启动器二次双击、老实例未退出）：先探测是否正是活着的 agent-purge
+		if (e.code === "EADDRINUSE") {
+			if (await probeAlive()) {
+				if (!noOpen) {
+					const res = openAppWindow(url);
+					if (res.mode === "app") console.log(`✓ 发现已在运行的 agent-purge 服务，已作为独立桌面窗口打开（${res.browser}）`);
+					else console.log(`✓ 发现已在运行的 agent-purge 服务，已在浏览器中打开：${url}`);
+				} else {
+					console.log(`agent-purge 服务已在 ${url} 运行`);
+				}
+				process.exit(0);
+			}
+			console.error(`${port} 已被占用且未响应 agent-purge 请求：可能是老实例卡死或其他程序占用。`);
+			console.error(`清掉再启：Get-NetTCPConnection -LocalPort ${port} -State Listen | % { Stop-Process -Id $_.OwningProcess -Force }`);
+		} else {
+			console.error(`web 启动失败：${e.message}`);
+		}
+		process.exit(1);
+	};
+
+	const server = serveWeb(port, { autoExit, onError: onServerError });
 	if (!noOpen) {
 		server.once("listening", () => {
 			const res = openAppWindow(`http://127.0.0.1:${server.address().port}`);

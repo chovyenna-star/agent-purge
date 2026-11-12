@@ -23,6 +23,8 @@ function sandbox(t) {
 		ProgramData: process.env.ProgramData,
 		PUBLIC: process.env.PUBLIC,
 		AGENT_PURGE_DRIVES: process.env.AGENT_PURGE_DRIVES,
+		PI_DESKTOP_DATA_DIR: process.env.PI_DESKTOP_DATA_DIR,
+		PI_DESKTOP_AGENT_DIR: process.env.PI_DESKTOP_AGENT_DIR,
 	};
 	process.env.USERPROFILE = home;
 	process.env.HOME = home;
@@ -36,6 +38,7 @@ function sandbox(t) {
 	process.env.PUBLIC = join(root, "Public");
 	process.env.AGENT_PURGE_DRIVES = join(root, "no-drive");
 	process.env.PATH = "";
+	for (const key of ["PI_DESKTOP_DATA_DIR", "PI_DESKTOP_AGENT_DIR"]) delete process.env[key];
 	t.after(() => {
 		for (const [k, v] of Object.entries(saved)) {
 			if (v === undefined) delete process.env[k];
@@ -103,6 +106,30 @@ test("detect: WorkBuddy 完全没装时仍是未安装", (t) => {
 	assert.equal(detect().workbuddy.homeExists, false);
 });
 
+test("detect: WorkBuddy AI 国际版安装目录（WorkBuddyAI.exe）被正确识别", (t) => {
+	const home = sandbox(t);
+	const install = join(home, "AppData", "Local", "Programs", "WorkBuddyAI");
+	mkdirSync(join(install, "resources"), { recursive: true });
+	writeFileSync(join(install, "WorkBuddyAI.exe"), "", "utf8");
+
+	const wbAi = detect()["workbuddy-ai"];
+	assert.equal(wbAi.found, true);
+	assert.equal(wbAi.homeExists, true);
+	assert.equal(detect().workbuddy.found, false, "国际版不应触发国内版命中");
+});
+
+test("detect: WorkBuddy AI 国际版靠 ~/.workbuddy-ai 认出来，并把配置根指向它", (t) => {
+	const home = sandbox(t);
+	const cfg = join(home, ".workbuddy-ai");
+	mkdirSync(cfg, { recursive: true });
+	writeFileSync(join(cfg, "settings.json"), "{}\n", "utf8");
+
+	const wbAi = detect()["workbuddy-ai"];
+	assert.equal(wbAi.found, true);
+	assert.equal(wbAi.home, cfg);
+	assert.equal(detect().workbuddy.found, false, "国际版配置根不应触发国内版命中");
+});
+
 test("detect: 桌面端装在 F 盘（不在任何默认目录）也能靠盘符扫到", (t) => {
 	const home = sandbox(t);
 	const root = dirname(home);
@@ -123,4 +150,14 @@ test("detect: 新装但还没写过配置文件的 CLI 也算装上（配置根�
 	const claude = detect().claude;
 	assert.equal(claude.found, true, "claude 新装没有 settings.json，不能因此算没装");
 	assert.equal(claude.home, join(home, ".claude"));
+});
+
+test("detect: PI-Desktop 只看自己的数据根，不把 pi CLI 当成 PI-Desktop", (t) => {
+	const home = sandbox(t);
+	mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+	assert.equal(detect()["pi-desktop"].found, false, "~/.pi/agent 是 pi CLI 的，不是 PI-Desktop 的");
+
+	mkdirSync(join(home, ".pi-desktop", "plugins"), { recursive: true });
+	assert.equal(detect()["pi-desktop"].found, true);
+	assert.equal(detect()["pi-desktop"].home, join(home, ".pi-desktop"));
 });

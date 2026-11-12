@@ -30,7 +30,8 @@ const DATA = dataHome();
 // sys = 系统提示/配置文件/插件 splice；user = 只落在用户消息里（zcode 的 hook）。
 const LAYER = {
 	pi: "sys", codex: "sys", codebuddy: "sys", claude: "sys", grok: "sys",
-	omp: "sys", opencode: "sys", hermes: "sys", antigravity: "sys", workbuddy: "sys", kilo: "sys",
+	omp: "sys", opencode: "sys", hermes: "sys", antigravity: "sys", workbuddy: "sys", "workbuddy-ai": "sys", kilo: "sys",
+	"pi-desktop": "sys",
 	// zcode 的内核 bundle 已核对：读取 ~/.zcode/AGENTS.md，且支持 customSystemPrompt
 	zcode: "sys",
 };
@@ -46,7 +47,7 @@ let store = null;
 const verifying = new Set();
 
 export function serveWeb(port = 7788, opts = {}) {
-	const { autoExit = false, heartbeatTimeout = 8000, initialConnectTimeout = 30000, onExit = null } = opts;
+	const { autoExit = false, heartbeatTimeout = 8000, initialConnectTimeout = 30000, onExit = null, onError = null } = opts;
 	ensureDataHome(isCompiled() ? null : ROOT);
 	store ??= createStore(DATA);
 
@@ -55,8 +56,13 @@ export function serveWeb(port = 7788, opts = {}) {
 		hasConnected: false,
 	};
 
+	// gen：每次发出页面 HTML 都 +1。页面卸载时带着自己那份 gen 上报，
+	// 过期的（上一个页面）一律忽略——否则旧页面的 beacon 晚到，会把刚刷出来的新页面一起带走。
+	const ctx = { heartbeatState, autoExit, gen: 0, leaveTimer: null };
+
 	let autoExitTimer = null;
 	const shutdown = (code = 0) => {
+		clearLeave(ctx);
 		if (autoExitTimer) { clearInterval(autoExitTimer); autoExitTimer = null; }
 		const doExit = () => {
 			if (typeof onExit === "function") onExit(code);
@@ -85,7 +91,7 @@ export function serveWeb(port = 7788, opts = {}) {
 		autoExitTimer.unref();
 	}
 
-	const ctx = { heartbeatState, shutdown, autoExit };
+	ctx.shutdown = shutdown;
 
 	// handle 是 async：任何异常都在这里收口，否则请求会挂着不响应
 	const server = createServer((req, res) => {
@@ -95,7 +101,10 @@ export function serveWeb(port = 7788, opts = {}) {
 			} catch {}
 		});
 	});
-	server.on("error", (e) => {
+	server.on("error", async (e) => {
+		if (typeof onError === "function") {
+			try { await onError(e); return; } catch {}
+		}
 		// 端口被旧实例占着的时候，--detach 是静默的 → 这里必须说人话，否则用户看到的是旧 UI
 		if (e.code === "EADDRINUSE") {
 			console.error(`${port} 已被占用：老实例还在跑（可能是改动前的版本，UI 会是旧的）。`);
@@ -116,11 +125,15 @@ async function handle(req, res, ctx = {}) {
 	const url = new URL(req.url, "http://127.0.0.1");
 	const p = url.pathname;
 
+	// 有请求就说明还有页面活着（刷新、重开、资源加载都算）：撤掉上一个页面留下的退出倒计时。
+	// 关键：刷新时 pagehide 先发、新页面请求随后到，这里负责把"刷新"和"关窗口"分开。
+	clearLeave(ctx);
+
 	// 防 CSRF：本机 Web 页面能 POST 就能写配置/改人设；跨站页面用 text/plain 也能发“简单请求”。
 	// 只放同源：Origin 的 host 必须和本次请求的 Host 完全一致（端口不同也挡住）。
 	if (isMutating(req.method) && !sameOrigin(req)) return send(res, 403, { error: "只接受本机同源请求" });
 
-	if (req.method === "GET" && (p === "/" || p === "/index.html")) return html(res);
+	if (req.method === "GET" && (p === "/" || p === "/index.html")) return html(res, ctx);
 	const assets = { '/app.js': 'text/javascript', '/model.mjs': 'text/javascript', '/evidence.mjs': 'text/javascript', '/styles.css': 'text/css' };
 	if (req.method === "GET" && Object.hasOwn(assets, p)) {
 		res.writeHead(200, { 'content-type': `${assets[p]}; charset=utf-8`, 'cache-control': 'no-store', 'x-content-type-options': 'nosniff' });
@@ -167,6 +180,19 @@ async function handle(req, res, ctx = {}) {
 		}
 		return;
 	}
+	if (req.method === "POST" && p === "/api/leave") {
+		// 页面卸载（刷新/关标签/关窗口）时发的信号。刷新和关窗口在浏览器里长得一样，
+		// 所以这里不立刻退：先等宽限期，新页面只要发出任何请求就会撤销（见 clearLeave）。
+		// 源码态 `agent-purge web` 归终端管，页面来去与它无关——永不自杀。
+		req.resume();
+		const gen = url.searchParams.get("gen");
+		const live = Boolean(ctx.autoExit) && gen !== null && gen === String(ctx.gen);
+		if (live) {
+			ctx.leaveTimer = setTimeout(() => { ctx.leaveTimer = null; ctx.shutdown(0); }, LEAVE_GRACE);
+			ctx.leaveTimer.unref?.();
+		}
+		return send(res, 200, { ok: true, exit: live });
+	}
 	if (req.method === "GET" && p === "/api/state") return send(res, 200, await state(url.searchParams.get("versions") === "1"));
 	if (req.method === "GET" && p === "/api/armor") return send(res, 200, armorState());
 	if (req.method === "POST" && p === "/api/apply") return send(res, 200, applyChanges(await body(req)));
@@ -191,7 +217,7 @@ async function handle(req, res, ctx = {}) {
 		return send(res, 200, resClean);
 	}
 	if (req.method === "GET" && p === "/api/update") {
-		const { checkForUpdate, checkNpmVersion, canReplaceSelf, detectInstallType, compareSemver } = await import("../lib/update.mjs");
+		const { checkForUpdate, checkNpmVersion, canReplaceSelf, detectInstallType, compareSemver, gitTrackState } = await import("../lib/update.mjs");
 		const force = url.searchParams.get("force") === "1";
 		const cacheFile = join(DATA, "update-cache.json");
 		const isExe = canReplaceSelf();
@@ -209,7 +235,11 @@ async function handle(req, res, ctx = {}) {
 		if (npm.ok && npm.latest && compareSemver(latest, npm.latest) > 0) {
 			latest = npm.latest;
 		}
-		const hasUpdate = compareSemver(current, latest) > 0;
+		// 源码检出还有第二种「有更新」：上游多了提交但版本号没变。只有手动刷新才 fetch，
+		// 否则每次开面板都要连一次 GitHub。
+		const git = installType === "git" ? gitTrackState({ fetch: force }) : null;
+		const behind = Number(git?.behind) > 0;
+		const hasUpdate = compareSemver(current, latest) > 0 || behind;
 
 		return send(res, 200, {
 			ok: gh.ok || npm.ok,
@@ -218,6 +248,7 @@ async function handle(req, res, ctx = {}) {
 			hasUpdate,
 			installType,
 			isExe,
+			git,
 			execPath: process.execPath,
 			npm: {
 				ok: npm.ok,
@@ -241,9 +272,31 @@ async function handle(req, res, ctx = {}) {
 	}
 	if (req.method === "POST" && p === "/api/update-upgrade") {
 		const reqPayload = await body(req);
-		const { checkForUpdate, downloadFile, replaceSelfExecutable, canReplaceSelf } = await import("../lib/update.mjs");
+		const { checkForUpdate, downloadFile, replaceSelfExecutable, canReplaceSelf, detectInstallType, gitPullSelf } = await import("../lib/update.mjs");
 		const isExe = canReplaceSelf();
-		const upgradeType = reqPayload?.type || (isExe ? "exe" : "npm");
+		const installType = detectInstallType();
+		const upgradeType = reqPayload?.type || installType;
+
+		// 源码检出：更新就是在这个目录里 git pull，不下载任何发布产物。
+		// --ff-only 由 gitPullSelf 保证：从面板点出来的更新不该悄悄造一个合并提交。
+		if (upgradeType === "git") {
+			try {
+				const r = gitPullSelf();
+				const changed = r.changed ? `${r.before} → ${r.after}` : `已在 ${r.after}（无新提交）`;
+				return send(res, 200, {
+					ok: true,
+					type: "git",
+					version: r.after,
+					message: r.changed
+						? `已快进更新：${changed}。重启 agent-purge 后生效。`
+						: `当前分支 ${r.branch} 已是最新（${changed}）。`,
+					output: r.output,
+					command: "git pull --ff-only",
+				});
+			} catch (error) {
+				return send(res, 500, { ok: false, type: "git", error: error.message, command: "git pull --ff-only" });
+			}
+		}
 
 		if (upgradeType === "npm") {
 			const { execFile } = await import("node:child_process");
@@ -638,10 +691,23 @@ function localHost(req) {
 			url.host === host.toLowerCase() && Number(url.port || 80) === req.socket.localPort;
 	} catch { return false; }
 }
-const html = (res) =>
-	res
+const html = (res, ctx = {}) => {
+	// 每次发页面都换一个代号：/api/leave 只认自己那一代，旧页面的 beacon 晚到也不会误伤新页面
+	const gen = String((ctx.gen = (ctx.gen ?? 0) + 1));
+	const page = readResource("web/ui.html").toString("utf8")
+		.replace('<meta name="ap-server-gen" content="">', `<meta name="ap-server-gen" content="${gen}">`);
+	return res
 		.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-store", "x-content-type-options": "nosniff", "content-security-policy": "default-src 'self'; script-src 'self'; style-src 'self'; img-src 'self' data:; connect-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'self'" })
-		.end(readResource("web/ui.html").toString("utf8"));
+		.end(page);
+};
+
+// 刷新页面时 pagehide 会先于新页面的请求到达：留一个宽限期，让"关窗口"和"刷新"各归各位。
+const LEAVE_GRACE = 1500;
+function clearLeave(ctx) {
+	if (!ctx?.leaveTimer) return;
+	clearTimeout(ctx.leaveTimer);
+	ctx.leaveTimer = null;
+}
 
 function isMutating(method) {
 	return method === "POST" || method === "PUT" || method === "PATCH" || method === "DELETE";

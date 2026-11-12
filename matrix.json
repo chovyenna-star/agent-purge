@@ -56,6 +56,21 @@
         "note": "sys 通过"
       }
     },
+    "pi-desktop": {
+      "class": "config",
+      "override": true,
+      "inject": true,
+      "hotSwitch": true,
+      "patch": false,
+      "launcher": "PI-Desktop（~/.pi/agent/SYSTEM.md 替换 persona 块；热切走 imported 插件扩展）",
+      "defaultSystemChars": null,
+      "purgedSystemChars": null,
+      "measuredVersion": "0.21.0",
+      "verify": "本机 0.21.0 便携版真实会话：装 imported 插件后新会话自称「小码酱」，同会话改 state.json 人设下一轮变「大肥鱼」，/purge off 后恢复 Gemini；SYSTEM.md 常驻另测（写入→自称测试体→卸载→恢复）",
+      "residue": "宿主操作规则/tool 指南保留；项目 .pi/SYSTEM.md 优先级高于全局；与 pi CLI 共用 ~/.pi/agent",
+      "note": "Electron + Rust host + pi Agent Harness；扩展只能由插件贡献（ADR 0215），agent-purge 以 imported 插件装 ExtensionAPI，/purge 与换人设热切换",
+      "preferredMode": "replace"
+    },
     "opencode": {
       "class": "plugin",
       "override": true,
@@ -276,16 +291,18 @@
       }
     },
     "antigravity": {
-      "class": "binary-patch",
-      "override": "binary only",
-      "inject": false,
+      "class": "config",
+      "override": true,
+      "inject": true,
       "hotSwitch": false,
-      "patch": true,
-      "launcher": "等长替换 resources/bin/language_server.exe 的身份句；协议有 systemPromptOverride 字段未验",
-      "defaultSystemChars": "≈20,498（可打印区段上界）",
-      "purgedSystemChars": null,
-      "measuredVersion": "1.23.x",
-      "verify": "scan-asar.mjs / 二进制复扫"
+      "patch": false,
+      "launcher": "~/.gemini/config/AGENTS.md 托管块（App 与 CLI 共用，落 systemInstruction 的 <user_rules>，无需手动选 agent）",
+      "defaultSystemChars": 15378,
+      "purgedSystemChars": 15895,
+      "measuredVersion": "CLI 1.5.3 / desktop 1.23.x",
+      "verify": "隔离 HOME 真实二进制抓包：off/strict/replace/append 四模式均捕获主请求，marker 全落 systemInstruction（system 15378 → 15895/15844/15843 字），<user_rules> 位于 </identity> 之后；真模型三问均自称新人设",
+      "residue": "<identity> 段仍在提示词里（\"You are Antigravity, ...\"），靠 <user_rules> 的 take-precedence 声明压住",
+      "preferredMode": "strict"
     },
     "codebuddy": {
       "purgedSystemChars": null,
@@ -323,12 +340,26 @@
       "inject": true,
       "hotSwitch": false,
       "patch": false,
-      "launcher": "WorkBuddy（settings.json → personalization.customPrompt，身份上下文；可逆）",
+      "launcher": "WorkBuddy（app/app-config.json → personalization.customPrompt，身份上下文；可逆）",
       "defaultSystemChars": null,
       "purgedSystemChars": null,
       "measuredVersion": "5.9.3",
-      "verify": "本机真实桌面会话验证：settings.json customPrompt 写入测试人设后，新任务回答“我是 AP_CUSTOM”；云端请求体不可见",
-      "note": "腾讯企业级桌面端；原生身份槽位 settings.json 的 personalization.customPrompt，无需解包 app.asar；名字/人设设定是 WorkBuddy 云端个人配置，agent-purge 不写入",
+      "verify": "本机真实桌面会话验证（5.9.3，CDP 发问）：app-config.json 写入人设后回答“阿绿”；只写 settings.json 时回答“阿紫”；两者都写时回答“阿绿”，确认 app-config.json 优先",
+      "note": "腾讯桌面端；原生身份槽位 personalization.customPrompt，AppConfigService 主存 ~/.workbuddy/app/app-config.json，settings.json 只作 legacy 回落；名字/人设设定是 WorkBuddy 云端个人配置，agent-purge 不写入",
+      "preferredMode": "replace"
+    },
+    "workbuddy-ai": {
+      "class": "config",
+      "override": true,
+      "inject": true,
+      "hotSwitch": false,
+      "patch": false,
+      "launcher": "WorkBuddy AI 国际版（app/app-config.json → personalization.customPrompt，身份上下文；可逆）",
+      "defaultSystemChars": null,
+      "purgedSystemChars": null,
+      "measuredVersion": "5.9.4",
+      "verify": "本机真实桌面会话验证（5.9.4，CDP 发问）：app-config.json 写入人设后回答“小满”；写入 settings.json 被忽略（回答仍是面板旧值），确认主路径是 app-config.json；IDENTITY.md/SOUL.md 同步生效；卸载后 app-config.json 与 user-* 文件字节还原",
+      "note": "腾讯桌面端国际版 WorkBuddy AI（workbuddy.ai）；身份槽位是 personalization.customPrompt，AppConfigService 主存 ~/.workbuddy-ai/app/app-config.json，settings.json 只作 legacy 回落；无需解包 app.asar",
       "preferredMode": "replace"
     },
     "kilo": {
