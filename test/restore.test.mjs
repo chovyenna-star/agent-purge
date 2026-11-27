@@ -96,10 +96,40 @@ test('oneshot opencode setup/cleanup are idempotent and preserve prior file', ()
 test('dsh temporary plugin restores prior package and patch; cleanup before setup is harmless', () => {
  const profile = dsh.profileDir('headless'); mkdirSync(profile, { recursive:true }); writeFileSync(join(profile,'package.json'), '{}'); writeFileSync(join(profile,'cordis.patch.yml'), '[]\n');
  dsh.addPlugin(dsh.SESSION, 'OLD SOURCE');
- const source = join(dsh.pluginDir('headless', dsh.SESSION), 'index.js');
+ const source = dsh.pluginFile(dsh.SESSION);
  const before = readFileSync(join(profile,'cordis.patch.yml'), 'utf8');
  const b = backends.dsh({ personaText:'test', mode:'append', args:[] }); b.cleanup(); assert.equal(readFileSync(source,'utf8'), 'OLD SOURCE');
  b.setup(); b.setup(); assert.notEqual(readFileSync(source,'utf8'), 'OLD SOURCE'); b.cleanup(); b.cleanup();
  assert.equal(readFileSync(source,'utf8'), 'OLD SOURCE'); assert.equal(readFileSync(join(profile,'cordis.patch.yml'),'utf8'), before);
  dsh.removePlugin(dsh.SESSION); assert.equal(readFileSync(join(profile,'cordis.patch.yml'),'utf8'), '[]\n'); assert.equal(journals().length, 0);
+});
+test('content already on disk: no journal and no lock is taken', () => {
+ const f = join(dir, 'same'); writeFileSync(f, 'same-bytes');
+ const undo = swapFile(f, 'same-bytes');
+ assert.equal(journals().length, 0);
+ undo(); undo();
+ assert.equal(readFileSync(f, 'utf8'), 'same-bytes');
+});
+test('second session joins an identical swap but a different one still conflicts', async () => {
+ const f = join(dir, 'join'); writeFileSync(f, 'original');
+ const pa = await owner(f);
+ assert.equal(journals().length, 1);
+ const undo = swapFile(f, 'temporary'); // 同内容：不加锁、不新增 journal
+ assert.equal(journals().length, 1); undo();
+ assert.throws(() => swapFile(f, 'other'), /持有者 PID \d+/);
+ await kill(pa); assert.equal(recover(collect), 1); assert.equal(readFileSync(f, 'utf8'), 'original');
+});
+test('dead owner is reclaimed once, then this swap proceeds', async () => {
+ const f = join(dir, 'reclaim'); writeFileSync(f, 'original');
+ const pa = await owner(f); await kill(pa);
+ const undo = swapFile(f, 'next');
+ assert.equal(readFileSync(f, 'utf8'), 'next');
+ undo(); assert.equal(readFileSync(f, 'utf8'), 'original'); assert.equal(journals().length, 0);
+});
+test('dead owner whose file was edited is not reclaimed', async () => {
+ const f = join(dir, 'reclaim-edited'); writeFileSync(f, 'original');
+ const pa = await owner(f); await kill(pa); writeFileSync(f, 'user edit');
+ assert.throws(() => swapFile(f, 'next'), /无法回收/);
+ assert.equal(readFileSync(f, 'utf8'), 'user edit');
+ for (const name of journals()) rmSync(join(journalDir, name));
 });

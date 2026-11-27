@@ -54,6 +54,60 @@ for(const harness of ['pi','omp']) test(`${harness}: generated extension same in
  await commands.purge.handler('on',ctx);assert.match(JSON.stringify((await hooks.before_agent_start({systemPrompt:host})).systemPrompt),/VERSION B/);
  state('replace','b',{armed:{}});assert.deepEqual((await hooks.before_agent_start({systemPrompt:host})).systemPrompt,host);
 });
+test('pi 1.5.x replace strips identity & <docs> while preserving custom <docs>, supports {{cwd}} & no-op off skip', async () => {
+ const pi152 = [
+  'You are a coding assistant running inside pi, a coding agent harness. Help users inspect files, run commands, and modify code.',
+  '<tools>\n- read: Read file\n</tools>',
+  '<rules>\n- Be concise in your responses\n</rules>',
+  '<docs>\nPi documentation (read only when the user asks about the harness itself, its SDK, extensions, themes, skills, or TUI):\n- Main documentation: C:/pi/README.md\n- Before implementing harness changes, read the relevant docs and examples in full, following related cross-references.\n</docs>',
+  '<project_context>\n<docs>USER CUSTOM DOCS</docs>\n</project_context>',
+  '<cwd>\nH:/WorkSpace\n</cwd>',
+ ].join('\n\n');
+ writeFileSync(join(root, 'personas', 'cwdp.md'), 'PERSONA IN {{cwd}}');
+ state('replace', 'cwdp');
+ const hooks = {}, commands = {}, notes = [];
+ (await fromSource(extensionSource(root, 'pi') + '\n// pi152')).default({
+  on: (k, v) => hooks[k] = v,
+  registerCommand: (k, v) => commands[k] = v,
+ });
+ const replaced = (await hooks.before_agent_start({ systemPrompt: pi152, systemPromptOptions: { cwd: 'H:\\WorkSpace\\proj' } })).systemPrompt;
+ assert.ok(replaced.startsWith('PERSONA IN H:/WorkSpace/proj'), replaced);
+ assert.doesNotMatch(replaced, /coding assistant running inside pi/);
+ assert.doesNotMatch(replaced, /Pi documentation \(read only/);
+ assert.match(replaced, /<tools>/);
+ assert.match(replaced, /<rules>/);
+ assert.match(replaced, /<docs>USER CUSTOM DOCS<\/docs>/);
+ assert.match(replaced, /<cwd>/);
+ assert.doesNotMatch(replaced, /<\/rules>\n\n\n+<project_context>/);
+
+ // 旧版无 <docs> 标签的裸文本同样切除
+ const barePi = 'You are an expert coding assistant operating inside pi, a coding agent harness.\n\nPi documentation (read only when the user asks about pi itself, its SDK, extensions, themes, skills, or TUI):\n- Always read pi .md files completely and follow links to related docs (e.g., tui.md for TUI API details)\n\nProject-specific instructions:';
+ const bareOut = (await hooks.before_agent_start({ systemPrompt: barePi })).systemPrompt;
+ assert.doesNotMatch(bareOut, /Pi documentation \(read only/);
+ assert.match(bareOut, /Project-specific instructions:/);
+
+ // 切回 off：带 systemPromptOptions 且未改动宿主时不返回 systemPrompt（避免触发 forceSystemPrompt）
+ state('off', 'cwdp');
+ const restored = (await hooks.before_agent_start({ systemPrompt: replaced, systemPromptOptions: { cwd: 'H:/WorkSpace/proj' } })).systemPrompt;
+ assert.equal(restored, pi152);
+ const noop = await hooks.before_agent_start({ systemPrompt: pi152, systemPromptOptions: { cwd: 'H:/WorkSpace/proj' } });
+ assert.equal(noop, undefined);
+
+ // /purge reload 给明确回显
+ await commands.purge.handler('reload', { ui: { notify: (msg) => notes.push(msg) } });
+ assert.match(notes.at(-1), /已重读/);
+});
+test('pi/omp off cleans residual resident agent-purge block from host system prompt', async () => {
+ state('replace', 'b'); const hooks = {}, commands = {};
+ const ext = (await fromSource(extensionSource(root, 'pi'))).default;
+ ext({ on: (k, v) => hooks[k] = v, registerCommand: (k, v) => commands[k] = v });
+ const resident = '# >>> agent-purge\nRESIDENT XIAOMAJIANG\n# <<< agent-purge\n\nYou are an AI assistant.\nTOOLS';
+ const ctx = { ui: { notify() {} } };
+ await commands.purge.handler('off', ctx);
+ const out = (await hooks.before_agent_start({ systemPrompt: resident })).systemPrompt;
+ assert.equal(out, 'You are an AI assistant.\nTOOLS');
+ assert.doesNotMatch(out, /RESIDENT XIAOMAJIANG/);
+});
 test('pi context: preserves content metadata and user attachments; off removes only own user prefix',async()=>{
  state('append','a',{piUserLayer:true});const hooks={};(await fromSource(extensionSource(root,'pi')+'\n// context')).default({on:(k,v)=>hooks[k]=v,registerCommand(){}});
  const original=[{role:'system',content:[{type:'text',text:'TOOLS',cache_control:{type:'ephemeral'}}]},{role:'user',content:[{type:'text',text:'QUESTION'},{type:'image',source:{data:'Y'}}]}];
@@ -77,7 +131,7 @@ test('resident opencode v1/v2: actual generated callbacks follow active file, di
 });
 test('dsh same callback: A→B→off, sync result preserved; slash mode scoped to profile',async()=>{
  const {install}=await import('../lib/persist.mjs');state('append');install('dsh',{root,active:join(root,'personas','active.md')});
- const file=join(root,'profiles','headless','node_modules','agent-purge','index.js');const plugin=(await import(pathToFileURL(file))).default;
+ const file=join(root,'dsh','agent-purge','index.js');const plugin=(await import(pathToFileURL(file))).default;
  let asm={sections:[{name:'host',text:'HOST',cache_control:{type:'ephemeral'}}]};const original=structuredClone(asm);const ctx={systemPrompt:{assemble:()=>asm}};plugin.apply(ctx);
  asm=ctx.systemPrompt.assemble();state('append','b');asm=ctx.systemPrompt.assemble();assert.doesNotMatch(JSON.stringify(asm),/VERSION A/);
  state('strict','b');asm=ctx.systemPrompt.assemble();state('off','b');asm=ctx.systemPrompt.assemble();assert.deepEqual(asm,original);
@@ -87,10 +141,10 @@ test('dsh slash mode: defaults to purge off until explicitly turned on via /purg
  // 同时武装 install 和 slash，未执行 /purge on（dshRuntime 为空或 enabled 为 false）
  state('append','a',{armed:{dsh:['install','slash']},dshRuntime:{headless:{enabled:false}}});
  install('dsh',{root,active:join(root,'personas','active.md')});
- const file=join(root,'profiles','headless','node_modules','agent-purge','index.js');
+ const file=join(root,'dsh','agent-purge','index.js');
  const plugin=(await import(pathToFileURL(file).href+'?slash-default-off')).default;
  const original={sections:[{name:'host',text:'HOST'}]};
- const ctx={systemPrompt:{assemble:()=>structuredClone(original)}};
+ const ctx={get:(k)=>k==='profileContext'?{name:'headless'}:undefined,systemPrompt:{assemble:()=>structuredClone(original)}};
  plugin.apply(ctx);
  // 默认处于 purge off 状态：不修改系统提示词
  let asm=ctx.systemPrompt.assemble();
@@ -136,7 +190,7 @@ test('overrides: runtime reads the per-harness persona/mode, global stays as fal
  // dsh：三个 profile 共用一份插件，统一按 "dsh" 查例外
  state('append','a',{overrides:{dsh:{persona:'b'}}});
  install('dsh',{root,active:join(root,'personas','active.md')});
- const dshPlugin=(await import(pathToFileURL(join(root,'profiles','headless','node_modules','agent-purge','index.js')).href+'?overrides')).default;
+ const dshPlugin=(await import(pathToFileURL(join(root,'dsh','agent-purge','index.js')).href+'?overrides')).default;
  const ctx2={systemPrompt:{assemble:()=>({sections:[{name:'host',text:'HOST'}]})}};dshPlugin.apply(ctx2);
  const asm=ctx2.systemPrompt.assemble();
  assert.match(JSON.stringify(asm),/VERSION B/);assert.doesNotMatch(JSON.stringify(asm),/VERSION A/);
@@ -157,7 +211,7 @@ test('dsh deep purge: auto approval, noise stripping, strict complete and contex
  const { install } = await import('../lib/persist.mjs');
  state('strict', 'b');
  install('dsh', { root, active: join(root, 'personas', 'active.md') });
- const file = join(root, 'profiles', 'headless', 'node_modules', 'agent-purge', 'index.js');
+ const file = join(root, 'dsh', 'agent-purge', 'index.js');
  const plugin = (await import(pathToFileURL(file).href + '?deep-purge-test')).default;
  const hooks = {};
  let asm = {
@@ -205,5 +259,56 @@ test('dsh deep purge: auto approval, noise stripping, strict complete and contex
  state('off', 'b');
  const approvalOff = hooks['approval/request']({ toolName: 'bash' }, () => 'delegated');
  assert.equal(approvalOff, 'delegated');
+});
+
+test('dsh slash command plugin: applies without ReferenceError, registers /purge & /ap, updates per-profile state (issue #12)', async () => {
+ const { slashSource } = await import('../lib/dsh.mjs');
+ state('append', 'a', { armed: { dsh: ['install', 'slash'] }, dshRuntime: {} });
+ const plugin = (await fromSource(slashSource(root))).default;
+ assert.equal(plugin.name, 'agent-purge-slash');
+
+ const registered = {};
+ const mockCtx = {
+  get: (k) => k === 'profileContext' ? { name: 'web' } : undefined,
+  inject: (deps, callback) => {
+   callback({
+    commands: {
+     register: (spec) => { registered[spec.name] = spec; }
+    }
+   });
+  }
+ };
+
+ // issue #12: apply 不能报 ReferenceError: hostProfile is not defined 或 Assignment to constant variable
+ plugin.apply(mockCtx);
+ assert.ok(registered['purge']);
+ assert.ok(registered['ap']);
+
+ // 执行 /purge on，写入当前 profile (web)
+ const resOn = registered['purge'].handler({ rawInput: 'on' });
+ assert.equal(resOn.kind, 'success');
+ let st = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+ assert.equal(st.dshRuntime?.web?.enabled, true);
+
+ // 执行 /purge mode strict
+ const resMode = registered['purge'].handler({ rawInput: 'mode strict' });
+ assert.equal(resMode.kind, 'success');
+ st = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+ assert.equal(st.dshRuntime?.web?.mode, 'strict');
+
+ // 执行 /purge status
+ const resStatus = registered['purge'].handler({ rawInput: 'status' });
+ assert.equal(resStatus.kind, 'success');
+ assert.match(resStatus.text, /模式 strict/);
+
+ // 执行 /purge off
+ const resOff = registered['purge'].handler({ rawInput: 'off' });
+ assert.equal(resOff.kind, 'success');
+ st = JSON.parse(readFileSync(join(root, 'state.json'), 'utf8'));
+ assert.equal(st.dshRuntime?.web?.enabled, false);
+
+ // 不传 profileContext 也能安全回落，不报错
+ const fallbackCtx = { inject: () => {} };
+ plugin.apply(fallbackCtx);
 });
 

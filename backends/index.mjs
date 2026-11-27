@@ -8,6 +8,9 @@ import { opencodeSource } from "../lib/opencode.mjs";
 import { dataHome } from "../lib/home.mjs";
 import { swapFile } from "../lib/restore.mjs";
 import { installKilocode, uninstallKilocode } from "../lib/kilocode.mjs";
+import { antigravityBin, temporaryAntigravity } from "../lib/antigravity.mjs";
+import { AGENT_NAME as KIRO_AGENT, temporaryKiroAgent } from "../lib/kiro.mjs";
+import { kimiAgentFile, temporaryKimiAgent } from "../lib/kimi.mjs";
 
 function temporaryPlugin(harness, file, root, args) {
  let undo = null;
@@ -110,6 +113,85 @@ export const backends = {
 	},
 
 	// 需要落盘或调用方配合，CLI 不代劳，只给可复制的配方
+	// Qwen Code：官方 --system-prompt / --append-system-prompt；长正文受命令行长度限制。
+	qwen: ({ personaText, mode, args }) => ({
+		cmd: "qwen",
+		args:
+			mode === "off"
+				? [...args]
+				: [mode === "append" ? "--append-system-prompt" : "--system-prompt", inline(personaText), ...args],
+		residueHint: mode === "off" ? "" : "人设走命令行参数；超长正文可能撞 Windows 命令行上限",
+	}),
+
+
+	// Crush：人设走全局 CRUSH.md 的托管块（install 通道），命令行只负责启动。
+	crush: ({ args = [] }) => ({ cmd: "crush", args: [...args] }),
+
+
+	// Continue CLI：--rule 接受文件路径，作为规则/上下文追加；不是 core sys 替换。
+	continue: ({ personaPath, mode, args = [] }) => ({
+		cmd: "cn",
+		args: mode === "off" ? [...args] : ["--rule", personaPath, ...args],
+		residueHint: mode === "off" ? "" : "人设作为规则传入，只影响本次启动",
+	}),
+
+	// Qoder CLI：官方两个参数，整段 system prompt 或末尾追加。
+	qoder: ({ personaText, mode, args = [] }) => ({
+		cmd: "qodercli",
+		args: mode === "off" ? [...args] : [mode === "append" ? "--append-system-prompt" : "--system-prompt", inline(personaText), ...args],
+		residueHint: mode === "off" ? "" : "人设走命令行参数，只影响本次启动",
+	}),
+
+	// Kimi Code：agent file 的 Markdown 正文就是该 agent 的 system prompt。
+	kimi: ({ personaText, mode, args = [] }) => {
+		if (mode === "off") return { cmd: "kimi", args: [...args] };
+		let undo = null;
+		return {
+			cmd: "kimi",
+			args: ["--agent-file", kimiAgentFile(), ...args],
+			runtime: true,
+			note: "临时写 ~/.kimi-code/agents/agent-purge.md；退出按原字节还原",
+			setup: () => { if (!undo) undo = temporaryKimiAgent({ personaText }); },
+			cleanup: () => { if (undo) { undo(); undo = null; } },
+		};
+	},
+
+	// Auggie CLI：--rules 只是把内容追加进 rules[]（实测 identity 仍在）；
+	// 真正整份覆盖走隐藏的 --override-system-prompt（实测把 system_prompt 换成只剩人设）。
+	// replace/strict 用后者，append 用 --rules —— 这才和「这个人设到底有没有顶掉宿主」一致。
+	auggie: ({ personaPath, mode, args = [] }) => {
+		if (mode === "off") return { cmd: "auggie", args: [...args] };
+		const whole = mode === "replace" || mode === "strict";
+		return {
+			cmd: "auggie",
+			args: [whole ? "--override-system-prompt" : "--rules", personaPath, ...args],
+			residueHint: whole
+				? "人设整份替换 system prompt；只影响本次启动"
+				: "人设作为 rules[] 追加，宿主身份仍在（要用 replace 才顶得掉）",
+		};
+	},
+
+	// Goose：--system 追加系统指令，不是整份替换。
+	goose: ({ personaText, mode, args = [] }) => ({
+		cmd: "goose",
+		args: mode === "off" ? ["session", ...args] : ["session", "--system", inline(personaText), ...args],
+		residueHint: mode === "off" ? "" : "人设走命令行参数，只影响本次启动",
+	}),
+
+	// Kiro CLI：custom agent 的 prompt 是主会话 system prompt；启动前写临时 agent，退出还原。
+	kiro: ({ personaText, mode, args = [] }) => {
+		if (mode === "off") return { cmd: "kiro-cli", args: ["chat", ...args] };
+		let undo = null;
+		return {
+			cmd: "kiro-cli",
+			args: ["chat", "--agent", KIRO_AGENT, ...args],
+			runtime: true,
+			note: "临时写 ~/.kiro/agents/agent-purge.json；退出按原字节还原",
+			setup: () => { if (!undo) undo = temporaryKiroAgent({ personaText }); },
+			cleanup: () => { if (undo) { undo(); undo = null; } },
+		};
+	},
+
 	zcode: () => ({
 		manual: [
 			"CLI 拿不到 customSystemPrompt（只有 app-server/SDK 能传）；CLI 只有 UserPromptSubmit hook 注入，且落在 user 角色。",
@@ -139,12 +221,20 @@ export const backends = {
 		};
 	},
 
-	antigravity: () => ({
-		manual: [
-			"prompt 在 resources/bin/language_server.exe（Go embed.FS）。",
-			"闭源 App 的身份句在二进制里，只能等长替换；改动会使签名失效、更新被覆盖，所以默认不做。",
-		],
-	}),
+	// Antigravity：人设只能靠 ~/.gemini/config/AGENTS.md（App 与 CLI 共用、App 自己拼进
+	// systemInstruction 的 <user_rules>）。CLI 没有 --system-prompt 之类的启动参数，
+	// 所以这里按「装着跑」处理：启动前写入托管块，退出按 stash 还原。
+	antigravity: ({ personaText, mode, args = [] }) => {
+		if (mode === "off") return { cmd: antigravityBin(), args };
+		let undo = null;
+		return {
+			cmd: antigravityBin(),
+			args,
+			note: "人设写进 ~/.gemini/config/AGENTS.md；退出按原字节还原（已常驻的块不会被动）",
+			setup: () => { if (!undo) undo = temporaryAntigravity({ personaText, mode }); },
+			cleanup: () => { if (undo) { undo(); undo = null; } },
+		};
+	},
 };
 
 
@@ -195,6 +285,57 @@ export const oneshots = {
 		// backends.dsh 会自己补 --profile headless，这里只给 prompt（否则重复）
 		return backends.dsh({ personaText, mode, root, args: [prompt] });
 	},
+	qwen: ({ prompt, personaText, mode }) => ({
+		cmd: "qwen",
+		args: ["-p", prompt, ...(mode === "off" ? [] : [mode === "append" ? "--append-system-prompt" : "--system-prompt", inline(personaText)])],
+	}),
+	crush: ({ prompt }) => ({ cmd: "crush", args: ["run", prompt] }),
+	continue: ({ prompt, personaPath, mode }) => ({
+		cmd: "cn",
+		args: [...(mode === "off" ? [] : ["--rule", personaPath]), "-p", prompt],
+	}),
+	qoder: ({ prompt, personaText, mode }) => ({
+		cmd: "qodercli",
+		args: [...(mode === "off" ? [] : [mode === "append" ? "--append-system-prompt" : "--system-prompt", inline(personaText)]), "-p", prompt],
+	}),
+	kimi: ({ prompt, personaText, mode }) => {
+		if (mode === "off") return { cmd: "kimi", args: ["-p", prompt] };
+		let undo = null;
+		return {
+			cmd: "kimi",
+			args: ["-p", prompt, "--agent-file", kimiAgentFile()],
+			runtime: true,
+			setup: () => { if (!undo) undo = temporaryKimiAgent({ personaText }); },
+			cleanup: () => { if (undo) { undo(); undo = null; } },
+		};
+	},
+	// 一次性问答也要区分：--rules 只追加，replace/strict 必须用 --override-system-prompt
+	auggie: ({ prompt, personaPath, mode }) => ({
+		cmd: "auggie",
+		args: [
+			...(mode === "off"
+				? []
+				: [mode === "replace" || mode === "strict" ? "--override-system-prompt" : "--rules", personaPath]),
+			"-p",
+			prompt,
+		],
+	}),
+	goose: ({ prompt, personaText, mode }) => ({
+		cmd: "goose",
+		args: ["run", "-t", prompt, ...(mode === "off" ? [] : ["--system", inline(personaText)])],
+	}),
+	kiro: ({ prompt, personaText, mode }) => {
+		if (mode === "off") return { cmd: "kiro-cli", args: ["chat", "--no-interactive", prompt] };
+		let undo = null;
+		return {
+			cmd: "kiro-cli",
+			args: ["chat", "--no-interactive", "--agent", KIRO_AGENT, prompt],
+			runtime: true,
+			setup: () => { if (!undo) undo = temporaryKiroAgent({ personaText }); },
+			cleanup: () => { if (undo) { undo(); undo = null; } },
+		};
+	},
+
 	zcode: ({ prompt }) => ({
 		cmd: "zcode",
 		args: ["--prompt", prompt, "--mode", "yolo", "--output-format", "stream-json", "--no-color"],
@@ -208,6 +349,18 @@ export const oneshots = {
 			args: ["run", prompt, "--format", "json"],
 			setup: () => { if (!installed) { installKilocode(root, { personaText, mode }); installed = true; } },
 			cleanup: () => { if (installed) { uninstallKilocode(root); installed = false; } },
+		};
+	},
+	antigravity: ({ prompt, personaText, mode }) => {
+		// agy 没有 --system-prompt 之类的启动参数：人设只能落 AGENTS.md，跑完按原字节还原
+		if (mode === "off") return { cmd: antigravityBin(), args: ["-p", prompt] };
+		let undo = null;
+		return {
+			cmd: antigravityBin(),
+			args: ["-p", prompt],
+			note: "人设写进 ~/.gemini/config/AGENTS.md；退出按原字节还原",
+			setup: () => { if (!undo) undo = temporaryAntigravity({ personaText, mode }); },
+			cleanup: () => { if (undo) { undo(); undo = null; } },
 		};
 	},
 

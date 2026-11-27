@@ -23,6 +23,9 @@ function sandbox(t) {
 		ProgramData: process.env.ProgramData,
 		PUBLIC: process.env.PUBLIC,
 		AGENT_PURGE_DRIVES: process.env.AGENT_PURGE_DRIVES,
+		AGENT_PURGE_APP_DIRS: process.env.AGENT_PURGE_APP_DIRS,
+		PI_DESKTOP_DATA_DIR: process.env.PI_DESKTOP_DATA_DIR,
+		PI_DESKTOP_AGENT_DIR: process.env.PI_DESKTOP_AGENT_DIR,
 	};
 	process.env.USERPROFILE = home;
 	process.env.HOME = home;
@@ -35,7 +38,9 @@ function sandbox(t) {
 	process.env.ProgramData = join(root, "ProgramData");
 	process.env.PUBLIC = join(root, "Public");
 	process.env.AGENT_PURGE_DRIVES = join(root, "no-drive");
+	process.env.AGENT_PURGE_APP_DIRS = join(root, "no-apps");
 	process.env.PATH = "";
+	for (const key of ["PI_DESKTOP_DATA_DIR", "PI_DESKTOP_AGENT_DIR"]) delete process.env[key];
 	t.after(() => {
 		for (const [k, v] of Object.entries(saved)) {
 			if (v === undefined) delete process.env[k];
@@ -103,6 +108,30 @@ test("detect: WorkBuddy 完全没装时仍是未安装", (t) => {
 	assert.equal(detect().workbuddy.homeExists, false);
 });
 
+test("detect: WorkBuddy AI 国际版安装目录（WorkBuddyAI.exe）被正确识别", (t) => {
+	const home = sandbox(t);
+	const install = join(home, "AppData", "Local", "Programs", "WorkBuddyAI");
+	mkdirSync(join(install, "resources"), { recursive: true });
+	writeFileSync(join(install, "WorkBuddyAI.exe"), "", "utf8");
+
+	const wbAi = detect()["workbuddy-ai"];
+	assert.equal(wbAi.found, true);
+	assert.equal(wbAi.homeExists, true);
+	assert.equal(detect().workbuddy.found, false, "国际版不应触发国内版命中");
+});
+
+test("detect: WorkBuddy AI 国际版靠 ~/.workbuddy-ai 认出来，并把配置根指向它", (t) => {
+	const home = sandbox(t);
+	const cfg = join(home, ".workbuddy-ai");
+	mkdirSync(cfg, { recursive: true });
+	writeFileSync(join(cfg, "settings.json"), "{}\n", "utf8");
+
+	const wbAi = detect()["workbuddy-ai"];
+	assert.equal(wbAi.found, true);
+	assert.equal(wbAi.home, cfg);
+	assert.equal(detect().workbuddy.found, false, "国际版配置根不应触发国内版命中");
+});
+
 test("detect: 桌面端装在 F 盘（不在任何默认目录）也能靠盘符扫到", (t) => {
 	const home = sandbox(t);
 	const root = dirname(home);
@@ -123,4 +152,87 @@ test("detect: 新装但还没写过配置文件的 CLI 也算装上（配置根�
 	const claude = detect().claude;
 	assert.equal(claude.found, true, "claude 新装没有 settings.json，不能因此算没装");
 	assert.equal(claude.home, join(home, ".claude"));
+});
+
+test("detect: PI-Desktop 只看自己的数据根，不把 pi CLI 当成 PI-Desktop", (t) => {
+	const home = sandbox(t);
+	mkdirSync(join(home, ".pi", "agent"), { recursive: true });
+	assert.equal(detect()["pi-desktop"].found, false, "~/.pi/agent 是 pi CLI 的，不是 PI-Desktop 的");
+
+	mkdirSync(join(home, ".pi-desktop", "plugins"), { recursive: true });
+	assert.equal(detect()["pi-desktop"].found, true);
+	assert.equal(detect()["pi-desktop"].home, join(home, ".pi-desktop"));
+});
+
+test("detect: CLI 卸了只剩配置目录时 residueOnly=true（不能再算装上）", (t) => {
+	const home = sandbox(t);
+	mkdirSync(join(home, ".grok"), { recursive: true });
+	writeFileSync(join(home, ".grok", "config.toml"), "", "utf8");
+
+	const grok = detect().grok;
+	assert.equal(grok.found, true, "配置目录还在，found 仍是 true");
+	assert.equal(grok.residueOnly, true, "没有命令也没有安装目录，只剩残留");
+});
+
+test("detect: 命令在就不是残留", (t) => {
+	const home = sandbox(t);
+	const bin = join(home, ".opencode", "bin", process.platform === "win32" ? "opencode.exe" : "opencode");
+	mkdirSync(join(home, ".opencode", "bin"), { recursive: true });
+	writeFileSync(bin, "", "utf8");
+
+	assert.equal(detect().opencode.residueOnly, false);
+});
+
+test("detect: DSH NEXT 桌面版（D:\\DSH-NEXT\\DSH NEXT\\DSH NEXT.exe）不算只剩残留（#24）", (t) => {
+	const home = sandbox(t);
+	const profile = join(home, ".dsh", "profiles", "desktop");
+	mkdirSync(profile, { recursive: true });
+	writeFileSync(join(profile, "package.json"), "{}\n", "utf8");
+	// anywhere-labs/dsh-desktop 的 dsh-desktop-next：productName "DSH NEXT"、NSIS 允许自选目录
+	const drive = join(dirname(home), "drive");
+	const install = join(drive, "DSH-NEXT", "DSH NEXT");
+	mkdirSync(install, { recursive: true });
+	writeFileSync(join(install, "DSH NEXT.exe"), "", "utf8");
+	process.env.AGENT_PURGE_DRIVES = drive;
+
+	const dsh = detect().dsh;
+	assert.equal(dsh.install, install);
+	assert.equal(dsh.residueOnly, false);
+	assert.equal(dsh.found, true);
+});
+
+test("detect: 什么都没装的家既不是装上也不是残留", (t) => {
+	sandbox(t);
+	const crush = detect().crush;
+	assert.equal(crush.found, false);
+	assert.equal(crush.residueOnly, false);
+});
+
+test("detect: OpenCode 桌面版（Programs/ai.opencode.desktop/OpenCode.exe）不算只剩残留（#25）", (t) => {
+	const home = sandbox(t);
+	const cfg = join(home, ".config", "opencode");
+	mkdirSync(cfg, { recursive: true });
+	writeFileSync(join(cfg, "opencode.jsonc"), "{}\n", "utf8");
+	// Electron 桌面版：目录名是 bundle identifier 风格（ai.opencode.desktop），exe 叫 OpenCode.exe，
+	// 双击启动不经过 PATH —— 只按 CLI 找就只剩「有配置根、没程序本体」= 残留。
+	const install = join(home, "AppData", "Local", "Programs", "ai.opencode.desktop");
+	mkdirSync(install, { recursive: true });
+	writeFileSync(join(install, "OpenCode.exe"), "", "utf8");
+
+	const d = detect();
+	for (const id of ["opencode", "opencode2"]) {
+		assert.equal(d[id].install, install, `${id} 要认出桌面版安装目录`);
+		assert.equal(d[id].bin, null, "桌面版不是 PATH 上的命令，不能凭空造出 bin");
+		assert.equal(d[id].residueOnly, false, `${id} 有程序本体，不是残留`);
+		assert.equal(d[id].found, true);
+	}
+});
+
+test("detect: 安装目录里只有 Uninstall OpenCode.exe 时不算装上（#25）", (t) => {
+	const home = sandbox(t);
+	const install = join(home, "AppData", "Local", "Programs", "ai.opencode.desktop");
+	mkdirSync(install, { recursive: true });
+	writeFileSync(join(install, "Uninstall OpenCode.exe"), "", "utf8");
+
+	assert.notEqual(detect().opencode.install, install, "exe 名精确匹配：Uninstall OpenCode.exe 不能冒充本体");
 });

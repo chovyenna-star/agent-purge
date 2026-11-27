@@ -1,13 +1,16 @@
-import { MODE_LABELS, CHANNEL_LABELS, CAPTURE_LABELS, personaName, configurationOf, changed, needsApply, sortedHarnesses, effectLabel, scopeSummary } from './model.mjs';
-import { verificationEvidence, captureScopeLabel } from './evidence.mjs';
+import { MODE_LABELS, MODE_DESCRIPTIONS, CHANNEL_LABELS, CAPTURE_LABELS, personaName, configurationOf, changed, needsApply, sortedHarnesses, installedOf as installed, disabledOf as disabledHere, effectLabel as effectLabelFor, harnessTitle, HARNESS_PURGE_EFFECTS, modeAvailability, unsupportedHarnesses, modeLabels, modeDescriptions, channelLabels, captureLabels, harnessPurgeEffects } from './model.mjs';
+import { applyDomI18n, fmtDateTime, fmtNumber, fmtTime, getLocale, isZh, listJoin, pick, setLocale, t } from './i18n.mjs';
+import { verificationEvidence } from './evidence.mjs';
+applyDomI18n();
+
 const $ = id => document.getElementById(id);
 // 数据只进入文本节点或固定属性，不解析来自人设/报告的 HTML。
 function node(tag, attrs = {}, ...children) {
-  const el = ['svg', 'path'].includes(tag) ? document.createElementNS('http://www.w3.org/2000/svg', tag) : document.createElement(tag);
+  const el = ['svg', 'path', 'circle'].includes(tag) ? document.createElementNS('http://www.w3.org/2000/svg', tag) : document.createElement(tag);
   for (const [key, value] of Object.entries(attrs)) {
     if (value === null || value === undefined || value === false) continue;
     if (key === 'class') {
-      if (['svg', 'path'].includes(tag)) el.setAttribute('class', String(value));
+      if (['svg', 'path', 'circle'].includes(tag)) el.setAttribute('class', String(value));
       else el.className = value;
     }
     else if (key === 'checked' || key === 'hidden' || key === 'disabled') el[key] = Boolean(value);
@@ -18,74 +21,153 @@ function node(tag, attrs = {}, ...children) {
   }
   return el;
 }
-const badge = (label, kind = '') => node('span', { class: `badge ${kind}` }, label);
-// 抽屉头的「⚡/🔄」emoji 换成内联 SVG：emoji 字形在 Windows 上按彩色位图渲染，和 11px 文字挤在一起忽大忽小
-const HOT_SVG = {
-  hot: node('svg', { viewBox: '0 0 16 16', width: '12', height: '12', 'aria-hidden': 'true' },
-    node('path', { d: 'M9 1.5 3.5 9h3l-1 5.5L12 7H8.8z', fill: 'currentColor' })),
-  restart: node('svg', { viewBox: '0 0 16 16', width: '12', height: '12', 'aria-hidden': 'true' },
-    node('path', { d: 'M13.5 8a5.5 5.5 0 1 1-1.6-3.9M13.5 1.5v3h-3', fill: 'none', stroke: 'currentColor', 'stroke-width': 1.6, 'stroke-linecap': 'round', 'stroke-linejoin': 'round' })),
-};
-const hotBadge = (label, kind = '', icon = 'hot') =>
-  node('span', { class: `badge ${kind}` }, HOT_SVG[icon].cloneNode(true), label);
+
+// 声明放在主题代码之前：resolvedTheme() 的默认参数会读 state，先声明就不会有人以后在 applyTheme
+// 之前调用它时踩到 TDZ（当前 applyTheme 会先写 data-theme，默认参数短路，暂时读不到 state）
+let state, base, draft, editor = null, editorBaseline = '', busy = false, activePage = 'console', expanded = null;
+let capture = null, draftConflict = false, project = null;
+const themeMedia = typeof window.matchMedia === 'function' ? window.matchMedia('(prefers-color-scheme: dark)') : null;
+const normalizeTheme = value => (value === 'light' || value === 'dark' ? value : 'auto');
+function resolvedTheme(setting = document.documentElement.dataset.theme || state?.settings?.theme || 'auto') {
+  const mode = normalizeTheme(setting);
+  if (mode === 'dark' || mode === 'light') return mode;
+  return themeMedia?.matches ? 'dark' : 'light';
+}
+function updateThemeToggle() {
+  const btn = $('theme-toggle');
+  if (!btn) return;
+  const isDark = resolvedTheme() === 'dark';
+  const label = isDark ? t('theme.toLight') : t('theme.toDark');
+  btn.setAttribute('title', label);
+  btn.setAttribute('aria-label', label);
+  btn.setAttribute('aria-pressed', String(isDark));
+  const svg = isDark
+    ? node('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' },
+        node('circle', { cx: '12', cy: '12', r: '4' }),
+        node('path', { d: 'M12 2v2m0 16v2M4.93 4.93l1.41 1.41m11.32 11.32 1.41 1.41M2 12h2m16 0h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41' }))
+    : node('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' },
+        node('path', { d: 'M12 3a6 6 0 0 0 9 9 9 9 0 1 1-9-9Z' }));
+  btn.replaceChildren(svg);
+}
+function applyTheme(setting) {
+  const mode = normalizeTheme(setting);
+  document.documentElement.dataset.theme = mode;
+  const actual = resolvedTheme(mode);
+  document.querySelector('meta[name="color-scheme"]')?.setAttribute('content', mode === 'auto' ? 'light dark' : actual);
+  document.querySelector('meta[name="theme-color"]')?.setAttribute('content', actual === 'dark' ? '#0B0F14' : '#F7F8FA');
+  document.querySelector('meta[name="ap-theme"]')?.setAttribute('content', mode);
+  updateThemeToggle();
+}
+applyTheme(document.documentElement.dataset.theme || document.querySelector('meta[name="ap-theme"]')?.getAttribute('content') || 'auto');
+themeMedia?.addEventListener?.('change', () => {
+  if (normalizeTheme(state?.settings?.theme || document.documentElement.dataset.theme) === 'auto') applyTheme('auto');
+});
+
+const chip = (label, kind = '', title = null) => node('span', { class: `chip ${kind}`, title }, label);
+const fmt = n => fmtNumber(n);
 const empty = label => node('p', { class: 'empty' }, label);
-const INSTALL_SOURCE = { shortcut: '开始菜单快捷方式', registry: '注册表卸载项', guess: '盘符扫描', scan: '盘内浅扫' };
-const HARNESS_ICON_FILES = { pi: 'pi.png', claude: 'claude.ico', codex: 'codex.webp', omp: 'omp.png', dsh: 'dsh.ico', grok: 'grok.ico', hermes: 'hermes.ico', opencode: 'opencode.ico', opencode2: 'opencode2.ico', codebuddy: 'codebuddy.png', zcode: 'zcode.png', workbuddy: 'workbuddy.png', kilo: 'kilo.png' };
-const harnessIcon = (id, size = 24) => {
-  // 真实图标在 web/assets/ 下（各官网/favicon 下载），不是手绘 SVG。
+
+const ICONS = {
+  'chevron-down': [['path', { d: 'm6 9 6 6 6-6' }]],
+};
+function icon(name, size = 14) {
+  const svg = node('svg', {
+    class: `lucide lucide-${name}`,
+    viewBox: '0 0 24 24', width: String(size), height: String(size),
+    fill: 'none', stroke: 'currentColor', 'stroke-width': '2',
+    'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true'
+  });
+  for (const [tag, attrs] of ICONS[name] || []) svg.append(node(tag, attrs));
+  return svg;
+}
+
+const HARNESS_ICON_FILES = { pi: 'pi.png', 'pi-desktop': 'pi-desktop.png', claude: 'claude.ico', codex: 'codex.webp', omp: 'omp.png', dsh: 'dsh.ico', grok: 'grok.ico', hermes: 'hermes.ico', opencode: 'opencode.ico', opencode2: 'opencode2.ico', codebuddy: 'codebuddy.png', zcode: 'zcode.png', workbuddy: 'workbuddy.png', 'workbuddy-ai': 'workbuddy.png', kilo: 'kilo.png', antigravity: 'antigravity.png', continue: 'continue.png', qoder: 'qoder.png', kimi: 'kimi.png', auggie: 'auggie.png', goose: 'goose.png', qwen: 'qwen.png', kiro: 'kiro.ico', crush: 'crush.png' };
+const harnessIcon = (id, size = 22) => {
   const file = HARNESS_ICON_FILES[id];
-  // ?v=2：旧版 server 对 /assets/ 发过 max-age=86400，浏览器里还留着换前的图；换 URL 绕开那份旧缓存（server 已改 no-store）。
-  const src = file ? `assets/${file}?v=2` : '';
-  const img = src
-    ? node('img', {
-        class: 'harness-avatar',
-        'data-id': id,
-        src,
-        alt: id,
-        width: String(size),
-        height: String(size)
-      })
-    : node('span', { class: 'harness-avatar fallback', 'aria-hidden': 'true' }, id.slice(0, 1).toUpperCase());
-  if (size !== 24) {
-    // CSP 禁内联 style；尺寸档位用类名表达（抽屉头 34px）
-    img.classList.add(size === 34 ? 'harness-avatar-lg' : 'harness-avatar-md');
-  }
-  return img;
+  const big = size > 22 ? ' tool-icon-lg' : '';
+  if (!file) return node('span', { class: `tool-icon is-fallback${big}`, 'aria-hidden': 'true' }, id.slice(0, 1).toUpperCase());
+  // ?v=2 绕开旧版 server 对 /assets/ 发过的 max-age 缓存
+  return node('img', { class: `tool-icon${big}`, src: `assets/${file}?v=2`, alt: '', width: String(size), height: String(size) });
 };
 
-let state, base, draft, editor = null, editorBaseline = '', busy = false, activePage = 'console', expanded = null;
-let capture = null, draftConflict = false;
-// Process failure, no request, off-mode success and a real marker miss are distinct.
+
+const CHANNELS = ['install', 'slash', 'shim', 'project'];
+const installSourceLabel = src => ({
+  shortcut: pick('开始菜单快捷方式', 'Start Menu shortcut'),
+  registry: pick('注册表卸载项', 'Uninstall registry entry'),
+  guess: pick('盘符扫描', 'Drive scan'),
+  scan: pick('盘内浅扫', 'Shallow disk scan'),
+}[src] || src);
+const channelStatic = c => ({
+  install: pick('写进这家自己的配置或插件，新开的会话读取。', 'Written to this tool’s own config or plugin; read by new sessions.'),
+  slash: pick('装上扩展后，在会话里执行 /purge on 开启；同一会话里可以换人设。', 'After installing the extension, run /purge on inside a session; switch personas anytime in the same session.'),
+  shim: pick('接管终端里的同名命令，启动时自动注入；桌面图标不受影响。', 'Wraps the CLI command in terminal to auto-inject at launch; desktop icons are unaffected.'),
+  project: pick('写进当前项目目录的规则文件，只影响这个目录。', 'Written to the rule file in the current project directory; affects only this directory.'),
+}[c]);
+const evidenceMap = () => ({
+  verified: [pick('命中人设', 'Persona hit'), 'is-on'],
+  'off-verified': [pick('暂停干净', 'Cleanly paused'), ''],
+  partial: [pick('部分命中', 'Partial hit'), 'is-warn'],
+  miss: [pick('请求未命中', 'Missed'), 'is-warn'],
+  'no-request': [pick('没抓到请求', 'No request'), 'is-fixed'],
+  unavailable: [pick('没找到入口', 'Not found'), 'is-fixed'],
+  blocked: [pick('被挡住', 'Blocked'), 'is-bad'],
+  error: [pick('运行出错', 'Error'), 'is-bad'],
+  mismatch: [pick('仍有残留', 'Residual'), 'is-bad'],
+  invalid: [pick('没有有效证据', 'Invalid evidence'), 'is-bad'],
+  'not-tested': [pick('没试过', 'Not tested'), '']
+});
+
 const captureFor = id => (capture?.report?.results ?? []).find(r => r.harness === id) || null;
-function evidenceBadge(id) {
-  const evidence = verificationEvidence(captureFor(id));
-  return badge(evidence.label, evidence.kind);
-}
-function verifyNote(id) {
-  const r = captureFor(id);
-  if (!r) return '没有本机请求证据；能力说明不是实测结果。此按钮只验证隔离 CLI，不验证正在运行的桌面会话。';
-  return `${r.version || '版本未知'} · ${captureScopeLabel(r.scope)} · ${r.at || capture?.report?.at || '时间未记录'} · ${r.reason || r.evidence || verificationEvidence(r).label}。不代表当前会话已应用。`;
-}
-const mode = () => document.querySelector('[name=mode]:checked')?.value || 'replace';
+const evidenceOf = result => {
+  const ev = verificationEvidence(result);
+  const [label, kind] = evidenceMap()[ev.state] || [ev.label, ''];
+  return { ...ev, label, chipClass: kind };
+};
+const whereLabel = scope => {
+  if (scope?.kind === 'isolated-cli') return pick(`临时环境${scope.profile ? ` · ${scope.profile}` : ''}`, `Isolated CLI${scope.profile ? ` · ${scope.profile}` : ''}`);
+  if (scope?.kind === 'isolated-session') return pick(`临时会话${scope.profile ? ` · ${scope.profile}` : ''}`, `Isolated session${scope.profile ? ` · ${scope.profile}` : ''}`);
+  return pick('临时环境', 'Isolated env');
+};
+const mode = () => document.querySelector('[name=mode]:checked')?.value || draft?.mode || 'replace';
 const configDirty = () => draft && base && changed(draft, base);
 const editorValue = () => ({ id: $('edit-id').value.trim(), meta: { name: $('edit-name').value.trim(), description: $('edit-desc').value.trim(), model: $('edit-model').value }, body: $('edit-body').value });
 const editorDirty = () => editor !== null && JSON.stringify(editorValue()) !== editorBaseline;
-function notify(message, kind = '') {
-  const el = $('notice'); el.textContent = message; el.className = `notice ${kind}`; el.hidden = false;
+
+function setConnection(text, kind = '') {
+  $('connection').className = `conn ${kind}`;
+  $('connection-text').textContent = text;
 }
-async function api(path, data, method = data ? 'POST' : 'GET') {
-  const response = await fetch(`/api/${path}`, { method, headers: data ? { 'content-type': 'application/json' } : {}, body: data ? JSON.stringify(data) : undefined });
-  let result; try { result = await response.json(); } catch { throw new Error('服务返回了无效内容，请确认本地服务仍在运行。'); }
-  if (!response.ok || result.error) throw new Error(result.error || `请求失败 (${response.status})`);
+function notify(message, kind = '') {
+  const el = $('notice');
+  el.textContent = message;
+  el.className = `notice ${kind}`;
+  el.hidden = false;
+  clearTimeout(notify.timer);
+  notify.timer = setTimeout(() => { el.hidden = true; }, 6000);
+}
+function pulseClass(el, cls, ms = 600) {
+  if (!el) return;
+  el.classList.remove(cls);
+  void el.offsetWidth;
+  el.classList.add(cls);
+  clearTimeout(el._pulseTimer);
+  el._pulseTimer = setTimeout(() => el.classList.remove(cls), ms);
+}
+async function api(path, data, method) {
+  const response = await fetch(`/api/${path}`, { method: method || (data ? 'POST' : 'GET'), headers: data ? { 'content-type': 'application/json' } : {}, body: data ? JSON.stringify(data) : undefined });
+  let result; try { result = await response.json(); } catch { throw new Error(pick('本地服务返回了无效内容，请确认它还在运行。', 'Local service returned invalid data; please verify it is running.')); }
+  if (!response.ok || result.error) throw new Error(result.error || pick(`请求失败 (${response.status})`, `Request failed (${response.status})`));
   return result;
 }
 function announce(result, success) {
   const report = result.applied || result;
   if (report.ok === false) {
     const failed = report.results?.filter(r => r.status === 'failed' || r.ok === false) || [];
-    notify(`${report.partial ? '部分变更已写入' : '操作未全部完成'}。${failed.map(r => `${r.harness}：${r.error}`).join('；') || '请查看诊断中的逐项结果。'}`, 'warn');
-  } else notify(success);
+    notify(`${report.partial ? pick('部分写入成功。', 'Partially applied. ') : pick('操作没有全部完成。', 'Operation incomplete. ')}${failed.map(r => `${harnessTitle(r.harness)}${pick('：', ': ')}${r.error}`).join(pick('；', '; ')) || pick('详情见「测试与记录」。', 'See Tests & Logs for details.')}`, 'warn');
+  } else notify(success, 'good');
 }
+
 const lockedControls = new Set();
 function lockControls() {
   if (!busy) return;
@@ -94,13 +176,13 @@ function lockControls() {
 function focusKey(el) {
   if (!el || el === document.body) return null;
   if (el.id) return { id: el.id };
-  const keys = ['expand', 'hpersona', 'hmode', 'toggle', 'channel', 'verify', 'auto', 'profile', 'closeDrawer'];
+  const keys = ['expand', 'hpersona', 'hmode', 'modeFollow', 'toggle', 'channel', 'verify', 'auto', 'profile', 'page'];
   const key = keys.find(key => el.dataset?.[key] !== undefined);
-  return key ? { key, value: el.dataset[key], drawer: Boolean(el.closest('.harness-drawer')) } : null;
+  return key ? { key, value: el.dataset[key] } : null;
 }
 function restoreFocus(key) {
   if (!key) return;
-  const target = key.id ? $(key.id) : [...document.querySelectorAll('[data-' + key.key.replace(/[A-Z]/g, c => '-' + c.toLowerCase()) + ']')].find(el => el.dataset[key.key] === key.value && Boolean(el.closest('.harness-drawer')) === key.drawer);
+  const target = key.id ? $(key.id) : [...document.querySelectorAll(`[data-${key.key.replace(/[A-Z]/g, c => '-' + c.toLowerCase())}="${CSS.escape(key.value)}"]`)][0];
   if (target && !target.disabled) target.focus({ preventScroll: true });
 }
 async function operation(work) {
@@ -118,351 +200,687 @@ async function operation(work) {
     restoreFocus(focus);
   }
 }
+
 async function refresh({ resetDraft = false } = {}) {
   const fresh = await api('state');
   try { capture = await api('verification'); } catch { capture = { report: null }; }
   const preserve = configDirty() && !resetDraft;
   draftConflict = Boolean(preserve && base && changed(configurationOf(fresh), base));
-  state = { ...fresh, personas: Array.isArray(fresh.personas) ? fresh.personas : [], harnesses: Array.isArray(fresh.harnesses) ? fresh.harnesses : [], defaults: fresh.defaults || { harness: null, mode: 'replace' }, armed: fresh.armed || {}, modes: fresh.modes || Object.keys(MODE_LABELS) }; base = configurationOf(state);
+  state = {
+    ...fresh,
+    personas: Array.isArray(fresh.personas) ? fresh.personas : [],
+    harnesses: Array.isArray(fresh.harnesses) ? fresh.harnesses : [],
+    defaults: fresh.defaults || { harness: null, mode: 'replace' },
+    armed: fresh.armed || {},
+    modes: fresh.modes || Object.keys(MODE_LABELS)
+  };
+  state.settingsDesktop = fresh.desktop || null;
+  if (fresh.locale) {
+    setLocale(fresh.locale);
+    applyDomI18n();
+  }
+  applyTheme(fresh.settings?.theme || 'auto');
+  base = configurationOf(state);
   if (!preserve) draft = { ...base };
-  $('connection').textContent = `本地服务已连接 · ${new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })}`;
+  setConnection(t('conn.connected', { time: fmtTime(Date.now()) }), 'is-live');
   render();
+
 }
+
 function render() {
-  $('version-badge').textContent = `v${state.version || '未知'}`;
   const p = state.personas.find(p => p.id === state.active);
   $('current-persona').textContent = personaName(p);
-  $('current-mode').textContent = `${MODE_LABELS[state.defaults.mode]} · ${p?.chars ?? 0} 字`;
-  $('power-status').textContent = state.paused ? '已暂停' : '配置启用';
-  $('power-status').className = `badge ${state.paused ? 'warn' : 'good'}`;
-  $('power').textContent = state.paused ? '恢复应用' : '暂停应用'; $('power').disabled = false;
-  const last = state.lastApply;
-  $('current-sync').textContent = last ? last.ok ? '同步记录已更新' : '有同步失败项' : '尚无应用记录';
-  $('persona-select').replaceChildren(...state.personas.map(p => new Option(`${personaName(p)} · ${p.chars} 字`, p.id)));
-  $('persona-select').value = draft.persona; $('persona-select').disabled = false;
-  document.querySelectorAll('[name=mode]').forEach(el => el.checked = el.value === draft.mode);
-  renderConfigControls(); renderHarnesses(); renderPersonas(); renderReport();
-  $('default-harness').replaceChildren(new Option('未设置', ''), ...state.harnesses.filter(h => h.oneshot && h.supported).map(h => new Option(`${h.id}${h.found ? '' : '（本机未发现）'}`, h.id)));
-  $('default-harness').value = state.defaultsSet ? state.defaults.harness : '';
-  $('default-summary').textContent = state.defaultsSet ? state.defaults.harness : '未设置';
-  $('diagnostic-state').textContent = JSON.stringify({ active: state.active, mode: state.defaults.mode, armed: state.armed, pausedInstalls: state.pausedInstalls, reconciled: state.reconciled, revision: last?.revision, runtimeConfirmed: last?.runtimeConfirmed }, null, 2);
+  $('current-mode').textContent = pick(`${fmt(p?.chars)} 字 · ${state.personas.length} 份可用`, `${fmt(p?.chars)} chars · ${state.personas.length} available`);
+  $('persona-description').textContent = p?.meta?.description || p?.meta?.desc || pick('这份人设没有写说明。', 'No description for this persona.');
+  const activeCount = state.harnesses.filter(consoleOn).length;
+  $('scope-count').textContent = String(activeCount);
+  const consoleTargets = state.harnesses.filter(isReadyTarget);
+  $('scope-total').textContent = String(consoleTargets.length);
+  $('coverage-strip').replaceChildren(...consoleTargets.map(h => node('i', { class: consoleOn(h) ? (state.paused ? 'is-warn' : 'is-on') : '' })));
+  $('coverage-strip').title = pick(`${activeCount} / ${consoleTargets.length} 个已就绪工具已启用`, `${activeCount} / ${consoleTargets.length} ready tools enabled`);
+
+  $('power-status').textContent = state.paused ? pick('已暂停', 'Paused') : pick('配置启用', 'Active');
+  $('power-status').className = `pill ${state.paused ? 'is-warn' : 'is-good'}`;
+  $('power').textContent = state.paused ? pick('恢复全部', 'Resume All') : pick('暂停全部', 'Pause All');
+  $('power').title = state.paused ? pick('恢复所有工具的人设注入', 'Resume persona injection for all tools') : pick('暂停全部工具的人设注入；只暂停某一家，在它的详情里选「暂停这家」', 'Pause persona injection for all tools; to pause one tool only, choose "Pause this tool" in its details');
+  $('power').disabled = false;
+  $('disarm-all').disabled = activeCount === 0;
+
+  $('persona-select').replaceChildren(...state.personas.map(p => new Option(pick(`${personaName(p)} · ${fmt(p.chars)} 字`, `${personaName(p)} · ${fmt(p.chars)} chars`), p.id)));
+  $('persona-select').value = draft.persona;
+  $('persona-select').disabled = false;
+
+  const projectPersonaSelect = $('project-persona-select');
+  if (projectPersonaSelect) {
+    const activePersona = state.personas.find(item => item.id === state.active);
+    const keepVal = rulePersona && state.personas.some(item => item.id === rulePersona) ? rulePersona : '';
+    projectPersonaSelect.replaceChildren(
+      new Option(pick(`跟随当前人设（${personaName(activePersona)}）`, `Follow current (${personaName(activePersona)})`), ''),
+      ...state.personas.map(item => new Option(pick(`${personaName(item)} · ${fmt(item.chars)} 字`, `${personaName(item)} · ${fmt(item.chars)} chars`), item.id))
+    );
+    projectPersonaSelect.value = keepVal;
+    rulePersona = keepVal;
+  }
+
+  document.querySelectorAll('[name=mode]').forEach(el => { el.checked = el.value === draft.mode; });
+
+  const defaults = $('default-harness');
+  defaults.replaceChildren(new Option(pick('未设置', 'Not set'), ''), ...state.harnesses.filter(h => h.oneshot && h.supported).map(h => new Option(`${harnessTitle(h.id)}${h.found ? '' : pick('（本机未发现）', ' (not found)')}`, h.id)));
+  defaults.value = state.defaultsSet ? state.defaults.harness : '';
+  $('default-summary').textContent = state.defaultsSet ? harnessTitle(state.defaults.harness) : pick('未设置', 'Not set');
+  $('diagnostic-state').textContent = JSON.stringify({ active: state.active, mode: state.defaults.mode, armed: state.armed, pausedInstalls: state.pausedInstalls, reconciled: state.reconciled, revision: state.lastApply?.revision, runtimeConfirmed: state.lastApply?.runtimeConfirmed }, null, 2);
+
+  $('version-badge').textContent = `v${state.version || pick('未知', 'unknown')}`;
+  updateThemeToggle();
+  renderConfigControls(); renderHarnesses(); renderPersonas(); renderReport(); renderSettings();
   renderEditorStatus(); lockControls();
 }
+
 function renderConfigControls() {
   const dirty = configDirty();
   const selected = state.personas.find(p => p.id === draft.persona);
-  $('persona-description').textContent = selected?.meta?.description || selected?.meta?.desc || '未填写说明';
-  $('draft-state').textContent = draftConflict ? '已保存配置发生变化；草稿保留，应用前请核对' : state.defaultsSet === false ? '首次设置尚未保存' : dirty ? '有待应用的选择' : '与已保存配置一致';
-  $('apply').textContent = state.defaultsSet === false ? '保存当前设置' : '应用变更';
+  const count = state.harnesses.filter(consoleOn).length;
+  const label = $('draft-state');
+  label.className = 'draft-state';
+  if (draftConflict) {
+    label.textContent = pick('保存的配置在别处变了，草稿仍在；应用前请核对', 'Saved config changed elsewhere while draft is active; review before applying');
+    label.classList.add('is-conflict');
+  } else if (state.defaultsSet === false) {
+    label.textContent = pick('第一次设置，保存后开始接管', 'First-time setup; save to start');
+  } else if (dirty) {
+    label.textContent = count ? pick(`有未保存的改动，会同步到 ${count} 个工具`, `Unsaved changes; will sync to ${count} tool(s)`) : pick('有未保存的改动', 'Unsaved changes');
+    label.classList.add('is-dirty');
+  } else {
+    label.textContent = pick('已与保存的配置一致', 'In sync with saved config');
+  }
+
+  $('apply').textContent = state.defaultsSet === false ? t('console.saveSettings') : t('console.applyChanges');
   $('apply').disabled = busy || !needsApply(state, draft, base) || !selected;
   $('reset-config').disabled = busy || !dirty;
-  const count = Object.values(state.armed).filter(v => v.length).length;
-  $('apply-hint').textContent = state.paused ? '已暂停，保存只记录选择，不写入任何执行器。' : count ? `保存后同步到这 ${count} 个执行器。` : '还没接管任何 AI，先在下面选一个。';
-}
-function miniSelect(h, kind) {
-  const isPersona = kind === 'persona';
-  const globalPersona = state.personas.find(p => p.id === state.persona);
-  const options = isPersona
-    ? [{ value: '', label: '人设·跟随' }, ...state.personas.map(p => ({ value: p.id, label: personaName(p) }))]
-    : [{ value: '', label: '模式·跟随' }, ...state.modes.map(m => ({ value: m, label: MODE_LABELS[m] }))];
-  // 只有真写了例外才选中覆盖值，否则选中“跟随全局”
-  const current = isPersona ? (h.personaFrom === 'override' ? h.persona || '' : '') : (h.modeFrom === 'override' ? h.mode || '' : '');
-  const globalNow = isPersona ? personaName(globalPersona) : MODE_LABELS[state.defaults?.mode || 'replace'];
-  const what = isPersona ? '人设' : '模式';
-  const shown = isPersona ? personaName(state.personas.find(p => p.id === h.persona)) : MODE_LABELS[h.mode] || h.mode;
-  const source = current ? '（单独指定）' : `（跟随全局：${globalNow}）`;
 
-  const selectedOpt = options.find(o => o.value === current) || options[0];
-
-  // 隐藏的原生 select 供保持底层的 form/change 事件派发机制
-  const nativeSelect = node('select', {
-    class: 'custom-select-native',
-    [isPersona ? 'data-hpersona' : 'data-hmode']: h.id,
-    tabindex: '-1',
-    'aria-hidden': 'true'
-  }, options.map(o => node('option', { value: o.value }, o.label)));
-  nativeSelect.value = current;
-
-  // 现代风格自定义触发按钮
-  const trigger = node('button', {
-    type: 'button',
-    class: `custom-select-trigger ${current ? 'is-override' : ''}`,
-    [isPersona ? 'data-hpersona' : 'data-hmode']: h.id,
-    title: `${h.id} 的${what}：${shown}${source}`,
-    'aria-haspopup': 'listbox',
-    'aria-expanded': 'false',
-    'aria-label': `${h.id} ${what}：当前 ${selectedOpt.label}`
-  },
-    node('span', { class: 'custom-select-label' }, selectedOpt.label),
-    node('svg', { class: 'custom-select-chevron', viewBox: '0 0 12 12', width: '9', height: '9', fill: 'none', 'aria-hidden': 'true' },
-      node('path', { d: 'M2.5 4.5L6 8L9.5 4.5', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }))
-  );
-
-  // 现代风格浮层选项面板
-  const menu = node('div', {
-    class: 'custom-select-menu',
-    role: 'listbox',
-    'aria-label': `${h.id} ${what} 选项`
-  }, options.map(o => {
-    const isSel = o.value === current;
-    return node('div', {
-      class: `custom-select-option ${isSel ? 'is-selected' : ''}`,
-      role: 'option',
-      'data-value': o.value,
-      'aria-selected': String(isSel),
-      tabindex: '-1'
-    },
-      node('span', { class: 'custom-select-option-text' }, o.label),
-      node('svg', { class: 'custom-select-check', viewBox: '0 0 12 12', width: '11', height: '11', fill: 'none', 'aria-hidden': 'true' },
-        node('path', { d: 'M2.5 6.5L4.8 8.8L9.5 3.5', stroke: 'currentColor', 'stroke-width': '1.6', 'stroke-linecap': 'round', 'stroke-linejoin': 'round' }))
-    );
-  }));
-
-  return node('div', {
-    class: `custom-select ${current ? 'is-override' : ''}`,
-    'data-custom-select': 'true'
-  }, trigger, menu, nativeSelect);
+  const unsupported = unsupportedHarnesses(state.harnesses.filter(consoleOn), draft.mode);
+  $('mode-hint').textContent = unsupported.length
+    ? pick(
+      `${MODE_DESCRIPTIONS[draft.mode] || ''} 已接管的 ${listJoin(unsupported.map(h => harnessTitle(h.id)))} 不支持这个力度，会按它自己的固定方式写入。`,
+      `${MODE_DESCRIPTIONS[draft.mode] || ''} Managed ${listJoin(unsupported.map(h => harnessTitle(h.id)))} do not support this mode and will use their fixed mode.`,
+    )
+    : MODE_DESCRIPTIONS[draft.mode] || '';
 }
 
-function initCustomSelects() {
-  document.addEventListener('click', e => {
-    const trigger = e.target.closest('.custom-select-trigger');
-    const option = e.target.closest('.custom-select-option');
+const consoleChannels = h => (h.armed || []).filter(c => c !== 'project');
+const consoleOn = h => consoleChannels(h).length > 0;
 
-    // 点击触发按钮：打开/关闭
-    if (trigger) {
-      e.preventDefault();
-      const container = trigger.closest('.custom-select');
-      if (!container) return;
-      const wasOpen = container.classList.contains('is-open');
-      closeAllCustomSelects();
-      if (!wasOpen) {
-        container.classList.add('is-open');
-        container.closest('.harness-capsule')?.classList.add('has-open-select');
-        trigger.setAttribute('aria-expanded', 'true');
-        // 智能定位：检测距离视口底部空间，不足时向上翻转
-        const menu = container.querySelector('.custom-select-menu');
-        if (menu) {
-          const rect = trigger.getBoundingClientRect();
-          const menuHeight = 180;
-          if (rect.bottom + menuHeight > window.innerHeight && rect.top > menuHeight) {
-            container.classList.add('is-dropup');
-          } else {
-            container.classList.remove('is-dropup');
-          }
-          if (rect.left + 160 > window.innerWidth) {
-            container.classList.add('is-align-right');
-          } else {
-            container.classList.remove('is-align-right');
-          }
-        }
-      }
-      return;
-    }
-
-    // 点击选项：选中并派发原生 change 事件
-    if (option) {
-      e.preventDefault();
-      const container = option.closest('.custom-select');
-      if (!container) return;
-      const native = container.querySelector('.custom-select-native');
-      const val = option.dataset.value;
-      if (native && native.value !== val) {
-        native.value = val;
-        native.dispatchEvent(new Event('change', { bubbles: true }));
-      }
-      closeAllCustomSelects();
-      return;
-    }
-
-    // 点击外部：关闭所有打开的下拉
-    closeAllCustomSelects();
-  });
-
-  document.addEventListener('keydown', e => {
-    if (e.key === 'Escape') {
-      closeAllCustomSelects();
-      return;
-    }
-    const open = document.querySelector('.custom-select.is-open');
-    if (!open) return;
-    const items = Array.from(open.querySelectorAll('.custom-select-option'));
-    let idx = items.findIndex(el => el.classList.contains('is-focused'));
-
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      idx = (idx + 1) % items.length;
-      items.forEach((el, i) => el.classList.toggle('is-focused', i === idx));
-      items[idx]?.scrollIntoView({ block: 'nearest' });
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      idx = (idx - 1 + items.length) % items.length;
-      items.forEach((el, i) => el.classList.toggle('is-focused', i === idx));
-      items[idx]?.scrollIntoView({ block: 'nearest' });
-    } else if (e.key === 'Enter' || e.key === ' ') {
-      if (idx >= 0 && items[idx]) {
-        e.preventDefault();
-        items[idx].click();
-      }
-    }
-  });
+function scopeLine() {
+  const active = state.harnesses.filter(consoleOn);
+  if (state.paused) return active.length ? pick(`已暂停；${active.length} 个工具的配置还留着，恢复后继续生效。`, `Paused; configs kept for ${active.length} tool(s) and will apply on resume.`) : pick('已暂停，当前没有工具在使用人设。', 'Paused; no tools are currently using a persona.');
+  if (!active.length) return pick('还没有接管任何工具。打开卡片右上角开关，或点「设置」即可开始。', 'No tools managed yet. Flip a card switch or click "Configure" to start.');
+  return pick(`正在接管 ${active.length} 个工具：${listJoin(active.map(h => harnessTitle(h.id)))}。`, `Managing ${active.length} tool(s): ${listJoin(active.map(h => harnessTitle(h.id)))}.`);
 }
 
-function closeAllCustomSelects() {
-  document.querySelectorAll('.custom-select.is-open').forEach(el => {
-    el.classList.remove('is-open', 'is-dropup', 'is-align-right');
-    el.querySelector('.custom-select-trigger')?.setAttribute('aria-expanded', 'false');
-    el.querySelectorAll('.custom-select-option').forEach(opt => opt.classList.remove('is-focused'));
-  });
-  document.querySelectorAll('.harness-capsule.has-open-select').forEach(el => el.classList.remove('has-open-select'));
+function toolStatus(h) {
+  const on = consoleOn(h);
+  const failed = state.lastApply?.results?.some(r => r.harness === h.id && r.status === 'failed');
+  if (on && failed) return { key: 'failed', label: pick('需重试', 'Retry needed') };
+  if (on && state.paused) return { key: 'paused', label: pick('已暂停', 'Paused') };
+  if (on && h.mode === 'off') return { key: 'paused', label: pick('单独暂停', 'Tool paused') };
+  if (on) return { key: 'on', label: pick('已接管', 'Managed') };
+  // 未来支持：还没确定能不能接管的家（matrix 里 planned = true）不画成「可接管」，
+  // 也不画成「未安装 / 缺命令行」——那是本机环境状态，不是能力状态。
+  if (h.planned) return { key: 'future', label: pick('未来支持', 'Planned') };
+  // 只剩残留配置（CLI 早卸了）不算装上；真装了但缺命令行的家下面还有专门一档。
+  if (!installed(h)) return { key: 'missing', label: h.residueOnly ? pick('残留配置', 'Leftovers only') : pick('未安装', 'Not installed') };
+  // 这家被单独关掉时注入不生效（resolveActivation 直接 stop('harness-disabled')），
+  // 开关也不是「可接管」那一路：必须如实标「已关闭」。
+  if (disabledHere(h)) return { key: 'disabled', label: pick('已关闭', 'Disabled') };
+  // 配置目录在、但命令不在，而且没有任何可点通道：真实状态是「装了配置、缺 CLI」，
+  // 不是「可接管」——给一个点了必然报错的开关比不给更糟。
+  const noChannel = !availableChannels(h).length;
+  if (noChannel && !h.caps?.launch?.ok && !h.bin) return { key: 'missing', label: pick('缺命令行', 'No CLI found') };
+  return { key: 'off', label: pick('可接管', 'Ready') };
 }
-function renderHarnesses() {
-  $('scope-summary').textContent = scopeSummary(state);
-  const rows = sortedHarnesses(state, $('show-all').checked);
-  if (!rows.length) {
-    $('harness-list').replaceChildren(empty('没发现任何可配置的 AI。勾选“显示本机没装的”看看能配哪些。'));
-    return;
-  }
 
-  const capsules = rows.map(h => {
-    const on = h.armed.length > 0;
-    const failed = state.lastApply?.results?.some(r => r.harness === h.id && r.status === 'failed');
-    const installed = Boolean(h.found || h.homeExists);
-    const isSelected = expanded === h.id;
-    let statusText = on ? '已选择' : installed ? h.bin ? '已就绪' : '发现配置' : '未安装';
-    if (on && state.paused) statusText = '已暂停';
-    if (on && !state.paused && h.mode === 'off') statusText = '单独暂停';
-    if (on && failed) statusText = '需重试';
+function toolSub(h) {
+  const info = HARNESS_PURGE_EFFECTS[h.id];
+  const kind = info?.typeLabel || ({
+    config: pick('配置托管', 'Config'),
+    plugin: pick('插件', 'Plugin'),
+    'launch-arg': pick('启动命令', 'CLI Arg'),
+    'file-swap': pick('文件替换', 'File Swap'),
+    'native-extension': pick('原生扩展', 'Extension'),
+    'config-or-hook': pick('配置 / 钩子', 'Config / Hook'),
+  }[h.class] || pick('配置', 'Config'));
+  const hot = h.caps?.hot?.ok && !kind.includes(pick('热切', 'Hot')) ? pick('热切', 'Hot-switch') : '';
+  return [kind, hot].filter(Boolean).join(' · ');
+}
 
-    const capsuleClass = [
-      'harness-capsule',
-      on ? 'is-on' : '',
-      failed ? 'is-bad' : '',
-      isSelected ? 'is-selected' : '',
-      !installed && !on ? 'is-uninstalled' : ''
-    ].filter(Boolean).join(' ');
+function availableChannels(h) {
+  return CHANNELS.filter(c => c !== 'project' && (h.caps?.[c]?.ok || channelOn(h, c)));
+}
+const channelOn = (h, c) => c === 'project' ? Boolean(h.projectOn) : h.armed.includes(c);
+// 默认列表只列「真装了」的家：没装的家既不能接管也不能点名启动，塞进列表只会误导。
+// planned 的家例外——用户需要知道「这家未来会支持」。
+const isReadyTarget = h => consoleOn(h) || Boolean(h.planned) || (installed(h) && (availableChannels(h).length > 0 || Boolean(h.caps?.launch?.ok)));
 
-    return node('div', { class: capsuleClass },
-      node('button', { type: 'button', class: 'capsule-body', 'data-expand': h.id, 'aria-expanded': String(isSelected), ...(isSelected ? { 'aria-controls': `drawer-${h.id}` } : {}), title: `${h.id} (${statusText}) - 点击展开详情` },
-        harnessIcon(h.id, 24),
-        node('div', { class: 'capsule-info' },
-          node('div', { class: 'capsule-name-row' },
-            node('span', { class: 'capsule-title' }, h.id),
-            node('span', { class: `capsule-dot ${on ? 'is-on' : ''}` }),
-            state.defaultsSet && state.defaults.harness === h.id && node('span', { class: 'capsule-badge-default' }, '默认')
-          ),
-          node('span', { class: 'capsule-status-text' }, statusText)
-        )
-      ),
-      node('label', { class: 'switch switch-sm', title: `${on ? '关闭' : '开启'} ${h.id} 接管` },
+let targetFilter = 'all';
+let targetQuery = '';
+let visibleTargets = [];
+
+const targetRows = () => [...$('harness-list').querySelectorAll('.target-row')];
+// 分组只看真实状态：装没装、这家是不是被单独关掉、有没有可写通道。
+// 以前只问「有没有可写通道」，于是没装的家（只剩残留配置、或配置目录都不存在）也被画成「可接管」，
+// 开关点开也写不进任何地方。
+const targetGroup = h => {
+  if (consoleOn(h)) return 'on';
+  // 还没确认能不能接管的家（kiro / goose）不算「未安装」——那是能力状态，不是本机环境状态。
+  if (h.planned) return 'future';
+  if (!installed(h)) return 'missing';
+  if (disabledHere(h)) return 'disabled';
+  if (availableChannels(h).length > 0) return 'ready';
+  return 'missing';
+};
+const groupOrder = () => [
+  ['on', pick('已接管', 'Managed')],
+  ['ready', pick('可接管', 'Ready')],
+  ['disabled', pick('已关闭', 'Disabled')],
+  ['future', pick('未来支持', 'Planned')],
+  ['missing', pick('未安装', 'Not installed')],
+];
+
+function matchesTarget(h) {
+  if (!$('show-all').checked && !isReadyTarget(h)) return false;
+  if (targetFilter !== 'all' && targetGroup(h) !== targetFilter) return false;
+  if (!targetQuery) return true;
+  const haystack = [h.id, harnessTitle(h.id), toolSub(h), toolStatus(h).label, ...availableChannels(h).map(c => CHANNEL_LABELS[c])]
+    .join(' ').toLowerCase();
+  return haystack.includes(targetQuery);
+}
+
+let lastGridKey = '';
+
+function targetRow(h, index = 0, animate = false) {
+  const status = toolStatus(h);
+  const on = consoleOn(h);
+  const active = h.id === expanded;
+  const rulesOnly = targetGroup(h) === 'rules';
+  const avail = modeAvailability(h);
+  const modeLabel = h.mode === 'off' ? pick('已暂停', 'Paused') : (MODE_LABELS[h.mode] || (avail.preferred ? MODE_LABELS[avail.preferred] : MODE_LABELS.replace));
+
+  const statusLabel = rulesOnly && !on ? pick('项目文件', 'Rule file') : status.label;
+  const statusChipClass = status.key === 'on' ? 'is-on' : status.key === 'paused' ? 'is-warn' : status.key === 'failed' ? 'is-bad' : status.key === 'future' ? 'is-future' : '';
+  // 没有任何可点通道时不给开关：要么点名启动（复制命令），要么如实说明缺什么。
+  // 以前这里照样画开关，点了必然报错——比没有开关更糟。
+  const noChannel = !availableChannels(h).length;
+  const launchOnly = !on && noChannel && Boolean(h.caps?.launch?.ok);
+  const switchTitle = pick(`${on ? '关闭' : '开启'} ${harnessTitle(h.id)} 接管`, `${on ? 'Disable' : 'Enable'} ${harnessTitle(h.id)}`);
+  const rightControl = on
+    ? node('label', { class: 'switch', title: switchTitle },
         node('input', {
-          type: 'checkbox',
-          'data-toggle': h.id,
-          checked: on,
-          disabled: !installed && !on,
-          'aria-label': `${on ? '关掉' : '打开'} ${h.id} 的人设接管`
+          type: 'checkbox', 'data-toggle': h.id, checked: true,
+          'aria-label': switchTitle
         }),
         node('span', { class: 'switch-track', 'aria-hidden': 'true' })
-      ),
-      // 单独占一行：胶囊水平空间只够放开关，塞在标题旁必被挤成“人设·”
-      node('div', { class: 'capsule-config' }, miniSelect(h, 'persona'), miniSelect(h, 'mode'))
-    );
-  });
+      )
+    : launchOnly
+    ? chip(pick('点名启动', 'Launch only'), '', h.caps.launch.how || pick(`用 agent-purge ${h.id} 启动`, `Start with agent-purge ${h.id}`))
+    : noChannel
+    ? chip(pick('缺命令行', 'No CLI'), '', h.caps?.launch?.why || h.caps?.shim?.why || pick('没有可用的接管方式', 'No usable takeover'))
+    : rulesOnly
+    ? chip(pick('仅项目规则', 'Project rules only'), '')
+    : node('label', { class: 'switch', title: switchTitle },
+        node('input', {
+          type: 'checkbox', 'data-toggle': h.id, checked: false,
+          disabled: !installed(h),
+          'aria-label': pick(`开启 ${harnessTitle(h.id)} 的人设接管`, `Enable persona injection for ${harnessTitle(h.id)}`)
+        }),
+        node('span', { class: 'switch-track', 'aria-hidden': 'true' })
+      );
 
-  const gridNode = node('div', { class: 'harness-grid' }, capsules);
-
-  const expandedHarness = rows.find(h => h.id === expanded);
-  let drawerNode = null;
-  if (expandedHarness) {
-    const h = expandedHarness;
-    const on = h.armed.length > 0;
-    const failed = state.lastApply?.results?.some(r => r.harness === h.id && r.status === 'failed');
-    const installed = Boolean(h.found || h.homeExists);
-    let statusBadge = on ? badge('已选择', 'good') : badge(installed ? '未接管' : '未安装', installed ? '' : 'warn');
-    if (on && state.paused) statusBadge = badge('已暂停', 'warn');
-    if (on && !state.paused && h.mode === 'off') statusBadge = badge('单独暂停', 'warn');
-    if (on && failed) statusBadge = badge('需要重试', 'bad');
-
-    const effect = effectLabel(h, state.paused, state.dshRuntime);
-
-    drawerNode = node('div', { id: `drawer-${h.id}`, class: 'harness-drawer' },
-      node('div', { class: 'drawer-header' },
-        node('div', { class: 'drawer-title-group' },
-          harnessIcon(h.id, 34),
-          node('div', { class: 'drawer-meta' },
-            node('div', { class: 'drawer-name-row' },
-              node('span', { class: 'drawer-title' }, h.id),
-              statusBadge,
-              h.hotSwitch ? hotBadge('支持热切', 'good', 'hot') : hotBadge('需新会话', '', 'restart'),
-              evidenceBadge(h.id),
-              state.defaultsSet && state.defaults.harness === h.id && badge('默认启动项', 'blue')
-            ),
-            Boolean(effect) && node('div', { class: 'drawer-effect' }, effect)
-          )
-        ),
-        node('div', { class: 'drawer-actions' },
-          node('label', { class: 'switch', title: `${on ? '关闭' : '开启'}接管` },
-            node('input', {
-              type: 'checkbox',
-              'data-toggle': h.id,
-              checked: on,
-              disabled: !installed && !on,
-              'aria-label': `${on ? '关掉' : '打开'} ${h.id} 的人设接管`
-            }),
-            node('span', { class: 'switch-track', 'aria-hidden': 'true' })
-          ),
-          node('button', {
-            type: 'button',
-            class: 'drawer-close',
-            'data-close-drawer': 'true',
-            'aria-label': '收起详情',
-            title: '收起详情'
-          }, '✕')
+  return node('article', {
+    class: `tool-card target-row${active ? ' is-active' : ''}${on ? ' is-on' : ''}${!installed(h) ? ' is-missing' : ''}${status.key === 'future' ? ' is-future' : ''}${animate ? ' is-entering' : ''}`,
+    'data-id': h.id, 'data-expand': h.id
+  },
+    node('div', { class: 'tool-card-top' },
+      node('div', { class: 'tool-card-id' },
+        harnessIcon(h.id, 28),
+        node('div', { class: 'tool-card-titles' },
+          node('strong', {}, harnessTitle(h.id)),
+          node('small', {}, toolSub(h))
         )
       ),
-      node('div', { class: 'drawer-body' }, harnessDetail(h))
+      rightControl
+    ),
+    node('div', { class: 'tool-card-foot' },
+      node('div', { class: 'tool-card-meta' },
+        node('span', { class: 'tool-card-index', 'aria-hidden': 'true' }, String(index + 1).padStart(2, '0')),
+        chip(statusLabel, statusChipClass),
+        node('span', {}, modeLabel)
+      ),
+      node('button', {
+        type: 'button', class: 'tool-card-more', 'data-expand': h.id,
+        'aria-label': pick(`设置 ${harnessTitle(h.id)}`, `Configure ${harnessTitle(h.id)}`)
+      }, pick('设置 →', 'Configure →'))
+    )
+  );
+}
+
+function renderTargetList(rows, animate = false) {
+  const list = $('harness-list');
+  if (!rows.length) {
+    list.replaceChildren(node('div', { class: 'target-empty' },
+      node('strong', {}, pick('没有匹配的目标', 'No matching targets')),
+      node('p', {}, targetQuery || targetFilter !== 'all' ? pick('换个关键词，或把筛选切回「全部」。', 'Try another keyword or switch filter back to "All".') : pick('勾选「显示未安装」看看还能接哪些。', 'Check "Show uninstalled" to see other supported tools.'))
+    ));
+    return;
+  }
+  const groups = new Map();
+  rows.forEach((h, idx) => {
+    const key = targetGroup(h);
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push({ h, idx });
+  });
+  const sections = [];
+  for (const [key, label] of groupOrder()) {
+    const items = groups.get(key);
+    if (!items?.length) continue;
+    sections.push(node('section', { class: 'tool-group', 'data-group': key },
+      node('div', { class: 'tool-group-head' },
+        node('span', {}, label),
+        node('span', { class: 'tool-group-count' }, String(items.length))
+      ),
+      node('div', { class: 'tool-grid-cards' }, items.map(({ h, idx }) => targetRow(h, idx, animate)))
+    ));
+  }
+  list.replaceChildren(...sections);
+}
+
+function closeDrawer({ restore = true } = {}) {
+  const prev = expanded;
+  expanded = null;
+  document.querySelector('.target-console')?.classList.remove('has-detail');
+  $('tool-drawer').hidden = true;
+  $('drawer-backdrop').hidden = true;
+  targetRows().forEach(row => row.classList.remove('is-active'));
+  if (restore && prev) {
+    document.querySelector(`.tool-card[data-id="${CSS.escape(prev)}"] .tool-card-more`)?.focus({ preventScroll: true });
+  }
+}
+
+function renderHarnesses() {
+  if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; }
+  $('scope-summary').textContent = scopeLine();
+  const showAll = $('show-all').checked;
+  const all = sortedHarnesses(state, showAll).filter(h => showAll || isReadyTarget(h));
+  visibleTargets = all.filter(matchesTarget);
+  $('harness-count').textContent = t('console.targetsVisibleCount', { visible: visibleTargets.length, total: all.length });
+  if (!visibleTargets.length) {
+    closeDrawer({ restore: false });
+    $('harness-list').replaceChildren(node('div', { class: 'target-empty' },
+      node('strong', {}, pick('没有匹配的目标', 'No matching targets')),
+      node('p', {}, targetQuery || targetFilter !== 'all' ? pick('换个关键词，或把筛选切回「全部」。', 'Try another keyword or switch filter back to "All".') : pick('勾选「显示未安装」看看还能接哪些。', 'Check "Show uninstalled" to see other supported tools.'))
+    ));
+    lockControls();
+    return;
+  }
+  if (expanded && !visibleTargets.some(h => h.id === expanded)) {
+    expanded = null;
+  }
+  const gridKey = visibleTargets.map(h => h.id).join(',');
+  const animate = gridKey !== lastGridKey;
+  lastGridKey = gridKey;
+  renderTargetList(visibleTargets, animate);
+  renderDetail(expanded);
+  lockControls();
+}
+
+function selectTarget(id, { focusClose = false } = {}) {
+  if (!id) return;
+  const h = state?.harnesses?.find(item => item.id === id);
+  if (!h) return;
+  if (detailTimer) { clearTimeout(detailTimer); detailTimer = null; }
+  const prev = expanded;
+  expanded = id;
+  targetRows().forEach(row => row.classList.toggle('is-active', row.dataset.id === id));
+  const wasOpen = !$('tool-drawer').hidden;
+  renderDetail(id);
+  if (!wasOpen) pulseClass($('tool-drawer'), 'is-opening', 520);
+  else if (prev !== id) pulseClass($('tool-drawer'), 'is-switching', 360);
+  if (focusClose) $('close-drawer')?.focus({ preventScroll: true });
+}
+
+let detailTimer = null;
+function renderDetail(id) {
+  const drawer = $('tool-drawer');
+  const backdrop = $('drawer-backdrop');
+  const host = $('tool-detail');
+  const h = id ? state?.harnesses?.find(item => item.id === id) : null;
+  const shell = document.querySelector('.target-console');
+  if (!h) {
+    shell?.classList.remove('has-detail');
+    drawer.hidden = true;
+    backdrop.hidden = true;
+    host.replaceChildren();
+    return;
+  }
+  shell?.classList.add('has-detail');
+  drawer.hidden = false;
+  backdrop.hidden = false;
+  host.replaceChildren(toolPanel(h));
+}
+function channelRow(h, c) {
+  const isOn = channelOn(h, c);
+  const info = h.caps?.[c] || {};
+  let why = info.ok ? channelStatic(c) : info.why || pick('不可用', 'Unavailable');
+  if (c === 'install' && ['dsh', 'opencode', 'opencode2'].includes(h.id)) why = pick('装成宿主插件，新开的会话自动读取；首次安装或更新代码后要重启一次。', 'Installed as a host plugin and read by new sessions; restart once after initial install or update.');
+  if (c === 'slash' && h.id === 'dsh') why = pick('装上 /purge 开关；注入仍靠常驻配置，两样都要启用。', 'Installs the /purge toggle; injection still relies on persistent config, so both must be enabled.');
+  if (c === 'project') why = pick(`写进当前目录的 ${h.caps?.project?.file || '规则文件'}；只影响这个目录。`, `Written to ${h.caps?.project?.file || 'rule file'} in the current directory; affects only this directory.`);
+  return node('div', { class: 'channel-item' },
+    node('div', { class: 'channel-head' },
+      node('div', { class: 'channel-name' }, CHANNEL_LABELS[c], isOn ? chip(pick('已启用', 'Enabled'), 'is-on') : null),
+      node('button', {
+        type: 'button', class: `btn btn-sm ${isOn ? 'btn-primary' : 'btn-ghost'}`, 'data-channel': c, 'data-target': h.id, 'data-enabled': String(!isOn),
+        title: isOn ? pick(`关闭 ${CHANNEL_LABELS[c]}`, `Disable ${CHANNEL_LABELS[c]}`) : pick(`启用 ${CHANNEL_LABELS[c]}`, `Enable ${CHANNEL_LABELS[c]}`)
+      }, isOn ? pick('关闭', 'Disable') : pick('启用', 'Enable'))
+    ),
+    node('div', { class: 'channel-why' }, why)
+  );
+}
+
+function unavailableDetail(h) {
+  const blocked = CHANNELS.filter(c => !h.caps?.[c]?.ok && !channelOn(h, c));
+  if (!blocked.length) return null;
+  return node('details', { class: 'fine' },
+    node('summary', {}, pick(`另有 ${blocked.length} 种方式对这家不适用`, `${blocked.length} other method(s) not applicable`)),
+    node('div', { class: 'fine-body' }, blocked.map(c => {
+      const cap = h.caps?.[c] || {};
+      const hidden = cap.hiddenLabel ? pick(`（曾用落点：${cap.hiddenLabel}）`, ` (former path: ${cap.hiddenLabel})`) : '';
+      return node('p', {}, node('strong', {}, CHANNEL_LABELS[c]), cap.why || pick('不可用', 'Unavailable'), hidden);
+    }))
+  );
+}
+
+/**
+ * 没有常驻/命令/插件落点时的「接管方式」正文。
+ * 以前这里是一句硬编码的「这家仅支持项目级规则文件」——对 launch-arg 型的家（qwen/kimi/kiro/
+ * goose/auggie/continue/qoder）纯属谎报：它们靠点名启动注入，而且其中好几家连项目规则
+ * 文件都没有。现在按 caps 说真话：能注入就给出命令，不能注入就报真实原因。
+ */
+function launchRow(h) {
+  const cap = h.caps?.launch || {};
+  if (!cap.backend) {
+    return node('p', { class: 'muted' }, h.reason || cap.why || pick('这家没有可用的注入通道。', 'No usable injection channel for this tool.'));
+  }
+  const cmd = `agent-purge ${h.id}`;
+  return node('div', { class: 'channel-item' },
+    node('div', { class: 'channel-head' },
+      node('div', { class: 'channel-name' }, pick('点名启动', 'Launch'),
+        chip(cap.ok ? pick('可用', 'Available') : pick('装好 CLI 就能用', 'Needs the CLI'), cap.ok ? 'is-on' : 'is-warn')),
+      node('button', {
+        type: 'button', class: 'btn btn-sm btn-ghost', 'data-copy-launch': h.id,
+        title: pick('复制启动命令', 'Copy launch command')
+      }, pick('复制命令', 'Copy'))
+    ),
+    node('div', { class: 'channel-why' },
+      pick(
+        `用它启动就带人设：${cap.how || '启动时注入'}。不改配置、不接管 PATH、不依赖 /purge，但只有从这里启动的会话生效。`,
+        `Starting this way carries the persona: ${cap.how || 'injected at launch'}. No config change, no PATH takeover, no /purge — but only sessions started this way are affected.`,
+      ),
+      cap.ok ? null : node('span', { class: 'hint' }, ` ${cap.why}`)
+    ),
+    node('code', { class: 'path' }, cmd)
+  );
+}
+
+function modeControl(h) {
+  const avail = modeAvailability(h);
+  const usable = ['replace', 'strict', 'append'].filter(m => avail.supported.has(m));
+  if (usable.length <= 1) {
+    return node('div', {},
+      node('div', { class: 'mode-readonly' },
+        node('strong', {}, MODE_LABELS[usable[0]] || pick('固定', 'Fixed')),
+        node('span', { class: 'hint' }, pick('固定方式', 'Fixed mode'))
+      ),
+      node('p', { class: 'panel-sub' }, avail.note || pick('这家只接受这一种写法。', 'This tool only supports this mode.')),
+      avail.purgeNote ? node('p', { class: 'panel-sub' }, avail.purgeNote) : null,
+      h.modeFrom === 'override'
+        ? node('button', { type: 'button', class: 'link', 'data-mode-follow': h.id }, pick('恢复跟随全局', 'Follow global'))
+        : null
     );
   }
+  const options = [new Option(pick(`跟随全局 · ${MODE_LABELS[draft.mode] || ''}`, `Follow global · ${MODE_LABELS[draft.mode] || ''}`), 'follow')];
+  for (const m of usable) options.push(new Option(`${MODE_LABELS[m]}${avail.preferred === m ? pick('（推荐）', ' (Recommended)') : ''}`, m));
+  options.push(new Option(pick('暂停这家', 'Pause this tool'), 'off'));
+  // 旧配置可能留着已归并的 strict；回落到等价的 replace，避免下拉框空选
+  const current = h.mode === 'off' ? 'off' : usable.includes(h.mode) ? h.mode : 'replace';
+  const value = h.modeFrom === 'override' ? current : 'follow';
+  const select = node('select', { class: 'select', 'data-hmode': h.id, 'aria-label': pick(`${harnessTitle(h.id)} 改写力度`, `${harnessTitle(h.id)} rewrite mode`) }, ...options);
+  select.value = value;
+  return node('div', {}, select,
+    avail.limited && avail.note ? node('p', { class: 'panel-sub' }, avail.note) : null,
+    avail.purgeNote ? node('p', { class: 'panel-sub' }, avail.purgeNote) : null,
+    unsupportedHarnesses([h], draft.mode).length && h.modeFrom !== 'override'
+      ? node('p', { class: 'panel-sub' }, pick(
+        `全局力度「${MODE_LABELS[draft.mode]}」对它不适用，实际按 ${MODE_LABELS[h.mode]} 写入。`,
+        `Global mode "${MODE_LABELS[draft.mode]}" does not apply here; writing as ${MODE_LABELS[h.mode]}.`,
+      ))
+      : null
+  );
+}
 
-  const focus = focusKey(document.activeElement);
-  $('harness-list').replaceChildren(gridNode, ...(drawerNode ? [drawerNode] : []));
-  lockControls();
-  if (!busy) restoreFocus(focus);
+function effectsDetail(h) {
+  const info = HARNESS_PURGE_EFFECTS[h.id];
+  if (!info) return null;
+  return node('details', { class: 'fine' },
+    node('summary', {}, pick('它会改写什么', 'What it modifies')),
+    node('ul', { class: 'effect-list' }, info.items.map(item => node('li', {}, item)))
+  );
 }
-function harnessDetail(h) {
-  const channels = ['install', 'slash', 'shim', 'project'];
-  // 项目块的真相在磁盘上（projectOn），armed 只是缓存
-  const channelOn = c => c === 'project' ? Boolean(h.projectOn) : h.armed.includes(c);
-  const supported = channels.filter(c => h.caps?.[c]?.ok || channelOn(c));
-  const desc = {
-    install: ['dsh', 'opencode', 'opencode2'].includes(h.id) ? '全局生效：装成宿主插件，新会话自动读取（无需每次带参数）；首次安装或更新代码需重启。' : '全局生效：写入这家自己的全局配置文件（人格/指令落点），新会话读取；不改命令本身。',
-    slash: h.id === 'dsh' ? '装上 /purge 命令插件后，在 dsh 会话里输 /purge on 开启当前会话。注意：它只是个开关，注入靠「常驻配置」，两样都要启用；首次安装要重启 dsh。' : '安装扩展后重新加载宿主，用 /purge on 开启当前会话：同一会话内热切换人设，不重开不重启。',
-    shim: '接管终端裸命令：在 PATH 前面放一层同名壳，以后你直接敲 codex/pi 就等于敲 agent-purge codex/pi，启动时自动注入；不影响已运行会话与桌面图标。',
-    project: `写进当前目录的 ${h.caps?.project?.file || 'AGENTS.md'}；其他原生执行器也可能读取这个同名文件。每个文件只登记一个管理归属，同时开全局通道会有两份。`,
-  };
-  const installed = Boolean(h.found || h.homeExists);
-  return [
-    node('div', { class: 'capsule-config drawer-config' }, miniSelect(h, 'persona'), miniSelect(h, 'mode')),
-    node('div', { class: 'verify-row' },
-      node('button', { class: 'secondary', 'data-verify': h.id, disabled: !installed, title: '临时 HOME + 测试人设 + 本地 provider；不检查或修改当前桌面会话' }, '隔离验证一次'),
-      node('div', {}, node('p', { class: 'help' }, verifyNote(h.id)))),
-    !supported.length && node('p', { class: 'detail-note' }, h.reason || h.caps?.install?.why || '没有可配置的通道'),
-    ...supported.map(channel => {
-      const isOn = channelOn(channel);
-      const blocked = !h.caps?.[channel]?.ok && !isOn;
-      return node('div', { class: 'channel-row' }, node('div', {}, node('strong', {}, CHANNEL_LABELS[channel]), node('p', { class: 'help' }, h.caps?.[channel]?.why || desc[channel])), node('button', { class: 'secondary', 'data-channel': channel, 'data-target': h.id, 'data-enabled': String(!isOn), disabled: blocked }, isOn ? '关闭' : '启用'));
-    }),
-    ['pi', 'omp'].includes(h.id) && h.armed.includes('slash') && node('label', { class: 'check-label advanced' }, node('input', { type: 'checkbox', 'data-auto': h.id, checked: state[`${h.id}Auto`] }), ' 新会话自动应用（关闭时须 /purge on）'),
-    h.id === 'dsh' && h.homeExists && node('div', { class: 'profile-options' }, state.dshAll.map(p => node('label', {}, node('input', { type: 'checkbox', 'data-profile': p, checked: state.dshProfiles.includes(p) }), p))),
-    node('details', { class: 'advanced' }, node('summary', {}, '技术详情与不可用通道'), node('p', { class: 'help' }, `热切能力：${h.caps?.hot?.how || h.caps?.hot?.why || '待核实'}`), node('p', { class: 'help' }, '配置路径：', node('code', { class: 'path' }, h.persistFile || h.home || '—')), h.install && h.install !== h.home ? node('p', { class: 'help' }, '安装目录：', node('code', { class: 'path' }, h.install), h.installSource ? `（${INSTALL_SOURCE[h.installSource] || h.installSource}）` : '') : null, node('p', { class: 'help' }, '命令入口：', node('code', { class: 'path' }, h.bin || '未发现')), channels.filter(c => !h.caps?.[c]?.ok).map(c => node('p', { class: 'help' }, `${CHANNEL_LABELS[c]}：${h.caps?.[c]?.why || '不可用'}`))),
-  ];
+
+function formatVerifyTime(raw) {
+  if (!raw) return pick('时间未记录', 'Time not recorded');
+  const d = new Date(raw);
+  if (Number.isNaN(d.getTime())) return String(raw);
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
+
+function verifyNote(h) {
+  const result = captureFor(h.id);
+  if (!result) return pick('还没试过。试跑在临时环境里进行，不碰你正在用的窗口。', 'Not tested yet. Runs in an isolated temp dir without touching active windows.');
+  const ev = evidenceOf(result);
+  const reason = result.reason ? ` · ${result.reason}` : '';
+  return pick(
+    `${ev.label} · ${whereLabel(result.scope)} · ${formatVerifyTime(result.at || capture?.report?.at)}${reason}（不代表当前会话）`,
+    `${ev.label} · ${whereLabel(result.scope)} · ${formatVerifyTime(result.at || capture?.report?.at)}${reason} (does not reflect active sessions)`,
+  );
+}
+
+function technicalDetail(h) {
+  return node('details', { class: 'fine' },
+    node('summary', {}, pick('技术细节', 'Technical details')),
+    node('div', { class: 'fine-body' },
+      node('p', {}, node('strong', {}, pick('热切机制', 'Hot-switch')), h.caps?.hot?.how || h.caps?.hot?.why || pick('启动时读取一次，改完要重开会话。', 'Read once at startup; restart session after changes.')),
+      node('p', {}, node('strong', {}, pick('配置路径', 'Config path')), node('code', { class: 'path' }, h.persistFile || h.home || '—')),
+      h.install && h.install !== h.home ? node('p', {}, node('strong', {}, pick('安装目录', 'Install dir')), node('code', { class: 'path' }, h.install), h.installSource ? ` · ${installSourceLabel(h.installSource)}` : '') : null,
+      node('p', {}, node('strong', {}, pick('命令入口', 'Command')), node('code', { class: 'path' }, h.bin || pick('未发现', 'Not found'))),
+      // 内置护栏是实测的：没抓过包的家显式标「未测」，别用「已净化干净」这种无法证伪的话
+      safetyLine(h),
+      purgeScopeLine(h)
+    )
+  );
+}
+/**
+ * 内置护栏（拒答 / 防破甲 / 防泄密 / 防注入）的实测数字。
+ * 数字必须是抓包实测的。没测的家显式标「未测」—— 「没测」和「已清干净」绝不能长得一样。
+ */
+function safetyLine(h) {
+  const s = h.safety;
+  if (!s) return null;
+  if (typeof s.off !== 'number') {
+    // 没抓过包就说没抓过：留白会让人误以为这家没有护栏
+    return node('p', {}, node('strong', {}, pick('内置护栏', 'Built-in guardrails')),
+      chip(pick('未测', 'not measured'), 'is-warn'),
+      s.note ? node('span', { class: 'hint' }, ` ${s.note}`) : null);
+  }
+  if (s.off === 0) {
+    return node('p', {}, node('strong', {}, pick('内置护栏', 'Built-in guardrails')),
+      pick(`实测 ${fmt(s.off)} 条（本来就没有可删的）`, `${fmt(s.off)} measured (nothing to remove)`));
+  }
+  const left = s.purged;
+  const tone = left > 0 ? 'is-warn' : 'is-on';
+  return node('p', {},
+    node('strong', {}, pick('内置护栏', 'Built-in guardrails')),
+    pick(`${fmt(s.off)} 条 → 剩 ${fmt(left)} 条`, `${fmt(s.off)} → ${fmt(left)} left`),
+    ' ',
+    chip(left === 0 ? pick('已清空', 'cleared') : pick('仍有残留', 'residual'), tone),
+    s.note ? node('span', { class: 'hint' }, ` ${s.note}`) : null
+  );
+}
+
+
+/**
+ * 净化范围：整份替换 / 只换身份段 / 只能追加。
+ * 这三者对外观感完全不同 —— 「整份替换」是宿主身份真的没了，
+ * 「只换身份段」是身份没了但工具说明还在，「追加」是身份还在。
+ */
+function purgeScopeLine(h) {
+  const scope = h.replaceScope;
+  if (!scope) return null;
+  const label = pick('净化范围', 'Purge scope');
+  if (scope === 'entire-system') {
+    return node('p', {}, node('strong', {}, label),
+      pick('整份替换：宿主原生 system 提示词被整段换掉，只剩人设（外加工具说明）', 'Whole-system replace: the native system prompt is swapped out entirely; only the persona (plus tool docs) remains'));
+  }
+  if (scope === 'identity-only') {
+    return node('p', {}, node('strong', {}, label),
+      pick('只换身份段：身份句没了，工具说明与运行规则仍由宿主写入', 'Identity-only: the identity sentence is gone, but tool docs and runtime rules still come from the host'));
+  }
+  return node('p', {}, node('strong', {}, label),
+    pick('只能追加：宿主没有整段入口，原生身份仍在提示词里', 'Append only: no full entry point, so the native identity stays in the prompt'));
+}
+
+function toolPanel(h) {
+  const channels = availableChannels(h);
+  const info = HARNESS_PURGE_EFFECTS[h.id];
+  const effect = consoleOn(h) ? effectLabelSafe(h) : null;
+  const ev = captureFor(h.id) ? evidenceOf(captureFor(h.id)) : null;
+
+  const personaOptions = [new Option(pick(`跟随全局（${personaName(state.personas.find(p => p.id === state.persona))}）`, `Follow global (${personaName(state.personas.find(p => p.id === state.persona))})`), '')];
+  for (const p of state.personas) personaOptions.push(new Option(personaName(p), p.id));
+  const personaSelect = node('select', { class: 'select', 'data-hpersona': h.id, 'aria-label': pick(`${harnessTitle(h.id)} 使用的人设`, `Persona for ${harnessTitle(h.id)}`) }, ...personaOptions);
+  personaSelect.value = h.personaFrom === 'override' ? h.persona : '';
+
+  const rulesOnly = targetGroup(h) === 'rules';
+  // 常驻/命令/插件都没落点、但点名启动能注入：主按钮改成复制启动命令，而不是点一下必然报错
+  const launchOnly = !consoleOn(h) && !channels.length && Boolean(h.caps?.launch?.ok);
+  const launchCmd = `agent-purge ${h.id}`;
+  const toggleBtn = launchOnly
+    ? node('button', {
+        type: 'button',
+        class: 'btn btn-primary',
+        'data-copy-launch': h.id,
+        title: pick('复制启动命令；用它启动即带人设，不需要预先开任何开关', 'Copy the launch command; starting this way carries the persona with no switch to enable')
+      }, pick('复制启动命令', 'Copy launch command'))
+    : rulesOnly
+    ? null
+    : node('button', {
+        type: 'button',
+        class: `btn ${consoleOn(h) ? 'btn-ghost' : 'btn-primary'}`,
+        'data-drawer-toggle': h.id,
+        disabled: !installed(h) && !consoleOn(h)
+      }, consoleOn(h) ? pick('关闭接管', 'Disable') : pick('开启接管', 'Enable'));
+
+  const closeIcon = node('svg', { viewBox: '0 0 24 24', 'aria-hidden': 'true' },
+    node('path', { d: 'M18 6 6 18M6 6l12 12' })
+  );
+
+  const targetIdx = visibleTargets.findIndex(item => item.id === h.id);
+  const indexTag = String((targetIdx >= 0 ? targetIdx : 0) + 1).padStart(2, '0');
+  const statusChipClass = toolStatus(h).key === 'on' ? 'is-on' : toolStatus(h).key === 'paused' ? 'is-warn' : toolStatus(h).key === 'failed' ? 'is-bad' : '';
+
+  return node('div', { class: 'tool-panel', id: `panel-${h.id}` },
+    node('div', { class: 'drawer-eyebrow' },
+      node('div', { class: 'drawer-eyebrow-left' },
+        node('span', { class: 'drawer-code' }, `TARGET // ${indexTag}`),
+        chip(toolStatus(h).label, statusChipClass)
+      ),
+      node('button', { type: 'button', id: 'close-drawer', class: 'icon-btn', 'aria-label': pick('关闭详情', 'Close details'), title: pick('关闭详情 (Esc)', 'Close details (Esc)') }, closeIcon)
+    ),
+    node('div', { class: 'detail-head' },
+      node('div', { class: 'detail-id' },
+        harnessIcon(h.id, 34),
+        node('div', {},
+          node('h2', {}, harnessTitle(h.id),
+            state.defaultsSet && state.defaults.harness === h.id ? node('span', { class: 'tool-flag' }, pick('默认', 'Default')) : null
+          ),
+          node('p', {}, `${toolSub(h)} · ${installed(h) ? pick('本机已安装', 'Installed') : pick('本机没装', 'Not installed')}`)
+        )
+      ),
+      toggleBtn ? node('div', { class: 'detail-actions' }, toggleBtn) : null
+    ),
+    node('section', { class: 'drawer-section' },
+      node('h3', {}, pick('01 // 独立设置', '01 // Tool Overrides')),
+      node('div', { class: 'panel-fields-grid' },
+        node('div', { class: 'panel-field' },
+          node('span', { class: 'field-label' }, pick('使用哪份人设', 'Persona')),
+          personaSelect
+        ),
+        node('div', { class: 'panel-field' },
+          node('span', { class: 'field-label' }, pick('改写力度', 'Mode')),
+          modeControl(h)
+        )
+      ),
+      ['pi', 'omp'].includes(h.id) && h.armed.includes('slash')
+        ? node('label', { class: 'check' }, node('input', { type: 'checkbox', 'data-auto': h.id, checked: state[h.id === 'pi' ? 'piAuto' : 'ompAuto'] }), pick(' 新会话自动应用（关闭时须执行 /purge on）', ' Auto-apply to new sessions (requires /purge on when off)'))
+        : null,
+      h.id === 'dsh' && h.homeExists
+        ? node('div', { class: 'panel-field' },
+            node('span', { class: 'field-label' }, pick('生效形态', 'Active Profiles')),
+            node('div', { class: 'profile-set' }, state.dshAll.map(p =>
+              node('label', { class: 'profile-chip' },
+                node('input', { type: 'checkbox', 'data-profile': p, checked: state.dshProfiles.includes(p) }),
+                node('span', {}, p)
+              )
+            ))
+          )
+        : null
+    ),
+    node('section', { class: 'drawer-section' },
+      node('h3', {}, pick('02 // 接管方式', '02 // Channels')),
+      channels.length
+        ? node('div', { class: `channel-list channel-count-${channels.length}` }, channels.map(c => channelRow(h, c)))
+        : launchRow(h),
+      unavailableDetail(h)
+    ),
+    node('div', { class: 'panel-foot' },
+      node('div', { class: 'panel-foot-head' },
+        node('h3', { class: 'panel-foot-title' }, pick('03 // 安全试跑', '03 // Dry-Run Verification'))
+      ),
+      node('div', { class: 'verify-bar' },
+        node('button', { type: 'button', class: 'btn btn-ghost btn-sm', 'data-verify': h.id, disabled: !installed(h), title: pick('在临时目录里跑一次，不读取也不修改当前会话', 'Run once in an isolated temp dir without touching active sessions') }, pick('试跑一次', 'Verify Once')),
+        ev ? chip(ev.label, ev.chipClass) : null,
+        node('span', { class: 'verify-note' }, verifyNote(h))
+      ),
+      node('div', { class: 'panel-meta-row' },
+        info ? effectsDetail(h) : null,
+        technicalDetail(h)
+      )
+    )
+  );
+}
+
+// effectLabel 来自 model.mjs，单独包一层避免老数据缺字段时报错
+function effectLabelSafe(h) {
+  try { return effectLabelFor(h); } catch { return null; }
+}
+/* ---------------- personas ---------------- */
 function renderPersonas() {
   const query = $('persona-search').value.toLocaleLowerCase();
-  const list = state.personas.filter(p => `${p.id} ${personaName(p)} ${p.meta.description || ''}`.toLocaleLowerCase().includes(query));
-  $('persona-list').replaceChildren(...(list.length ? list.map(p => node('button', { class: `persona-item ${editor === p.id ? 'selected' : ''}`, 'data-persona': p.id }, node('strong', {}, personaName(p)), node('small', {}, `${p.id} · ${p.chars} 字`), state.active === p.id && badge('当前人设', 'blue'))) : [empty('没有匹配的人设')]));
+  const list = state.personas.filter(p => `${p.id} ${personaName(p)} ${p.meta?.description || p.meta?.desc || ''}`.toLocaleLowerCase().includes(query));
+  $('persona-list').replaceChildren(...(list.length ? list.map(p => node('button', {
+    type: 'button', class: `persona-item ${editor === p.id ? 'selected' : ''}`, 'data-persona': p.id
+  }, node('strong', {}, personaName(p)), node('small', {}, pick(`${p.id} · ${fmt(p.chars)} 字`, `${p.id} · ${fmt(p.chars)} chars`)), state.active === p.id ? chip(pick('当前人设', 'Active'), '') : null)) : [empty(pick('没有匹配的人设', 'No matching personas'))]));
 }
-function confirmDiscard() { return !editorDirty() || window.confirm('这份人设有未保存修改，放弃修改？'); }
+function confirmDiscard() { return !editorDirty() || window.confirm(pick('这份人设有未保存的修改，放弃吗？', 'Discard unsaved changes to this persona?')); }
 function openEditor(id) {
   if (!confirmDiscard()) return;
   editor = id || '';
@@ -470,269 +888,855 @@ function openEditor(id) {
   $('editor-empty').hidden = true; $('editor-form').hidden = false;
   $('edit-id').value = p?.id || ''; $('edit-id').disabled = Boolean(p);
   $('edit-name').value = p?.meta?.name || ''; $('edit-desc').value = p?.meta?.description || p?.meta?.desc || '';
-  $('edit-body').value = p?.body || ''; $('edit-model').value = (p?.meta?.model || []).join(', ');
+  $('edit-body').value = p?.body || '';
+  const model = p?.meta?.model;
+  $('edit-model').value = Array.isArray(model) ? model.join(', ') : (model || '');
   editorBaseline = JSON.stringify(editorValue());
   renderEditorStatus(); renderPersonas();
 }
 function renderEditorStatus() {
   if (editor === null) return;
   const current = editor === state.active;
-  $('editor-title').textContent = editor ? current ? '编辑当前人设' : '编辑人设' : '新建人设';
-  $('editor-status').textContent = editorDirty() ? '未保存' : '已保存';
-  $('char-count').textContent = `${$('edit-body').value.trim().length} 字`;
-  $('save-persona').textContent = current ? '保存并同步' : '保存';
+  $('editor-title').textContent = editor ? (current ? t('library.editCurrentTitle') : t('library.editTitle')) : t('library.newTitle');
+  $('editor-status').textContent = editorDirty() ? t('library.unsaved') : t('library.saved');
+  $('char-count').textContent = pick(`${$('edit-body').value.trim().length} 字`, `${$('edit-body').value.trim().length} chars`);
+  $('save-persona').textContent = current ? t('library.saveAndSync') : t('console.save');
   $('save-persona').disabled = busy || !editorDirty();
   $('save-apply').hidden = current;
   $('save-apply').disabled = busy;
   $('delete-persona').disabled = busy || !editor || state.personas.length <= 1;
   $('edit-id').disabled = busy || Boolean(editor);
-  $('editor-hint').textContent = current ? '当前人设的正文保存后会同步到已选范围；暂停时不会恢复应用。' : '“保存”只更新人设库；“保存并应用”会切换当前人设并同步。';
+  $('editor-hint').textContent = current
+    ? pick('保存后会同步到已接管的工具；暂停时只更新人设，不恢复应用。', 'Saving syncs to managed tools; while paused, only the persona is updated.')
+    : pick('「保存」只改人设库；「保存并应用」会切换当前人设并同步。', '"Save" updates the library only; "Save & Apply" switches the active persona and syncs.');
 }
 async function saveEditor(apply) {
   if (!$('editor-form').reportValidity()) return;
   const value = editorValue();
-  if (!editor && state.personas.some(p => p.id === value.id)) { notify('这个标识已存在，请换一个标识，避免覆盖已有的人设。', 'error'); return; }
+  if (!editor && state.personas.some(p => p.id === value.id)) { notify(pick('这个标识已经存在，换一个再试。', 'This ID already exists; choose another.'), 'error'); return; }
   await operation(async () => {
     const result = await api('persona', { ...value, apply });
     editor = result.persona.id;
     editorBaseline = JSON.stringify(value);
     await refresh({ resetDraft: apply });
-    announce(result, apply ? '人设已保存并应用。' : '人设已保存。');
+    announce(result, apply ? pick('人设已保存并应用。', 'Persona saved and applied.') : pick('人设已保存。', 'Persona saved.'));
   });
 }
+
+/* ---------------- reports ---------------- */
 function renderReport() {
   const r = state.lastApply;
   $('retry-failed').hidden = !r?.results?.some(x => x.status === 'failed');
-  $('report-meta').textContent = r ? `${new Date(r.at).toLocaleString('zh-CN')} · 版本 ${r.revision} · ${MODE_LABELS[r.mode]}` : '应用后会记录每个通道的写入结果。';
-  $('apply-results').className = '';
-  $('apply-results').replaceChildren(...(!r ? [empty('尚无应用记录')] : !r.results.length ? [empty('配置已保存，当前没有需要写入的通道。')] : r.results.map(x => node('div', { class: 'result-row' }, node('div', {}, node('strong', {}, x.harness), node('p', { class: 'muted' }, CHANNEL_LABELS[x.channel] || x.channel)), badge(x.status === 'failed' ? '写入失败' : '配置已处理', x.status === 'failed' ? 'bad' : 'good'), node('p', { class: x.status === 'failed' ? 'error-text' : 'muted' }, x.error || x.message || '', x.status !== 'failed' && [node('br'), '运行中会话：尚未确认'])))));
+  $('report-meta').textContent = r
+    ? `${fmtDateTime(r.at)} · ${MODE_LABELS[r.mode] || r.mode} · ${pick(`${r.results.length} 项`, `${r.results.length} item(s)`)}`
+    : pick('应用后，这里会按工具记录写入结果。', 'Write results per tool will appear here after applying.');
+  $('apply-results').replaceChildren(...(!r
+    ? [empty(pick('还没有应用记录。', 'No apply records yet.'))]
+    : !r.results.length
+      ? [empty(pick('配置已保存，当前没有需要写入的通道。', 'Configuration saved; no channels needed writing.'))]
+      : r.results.map(x => node('div', { class: 'result-row' },
+          node('div', { class: 'result-title' }, harnessTitle(x.harness), chip(x.status === 'failed' ? pick('失败', 'Failed') : pick('已写入', 'Written'), x.status === 'failed' ? 'is-bad' : 'is-on')),
+          node('div', { class: 'result-detail' }, `${CHANNEL_LABELS[x.channel] || x.channel}${x.message ? ` · ${x.message}` : ''}`, x.status === 'failed' ? null : node('span', { class: 'hint' }, pick(' · 运行中的会话尚未确认', ' · Active sessions unconfirmed'))),
+          x.error ? node('div', { class: 'result-detail error' }, x.error) : null
+  ))));
 }
+
 function captureRow(result) {
+  const ev = evidenceOf(result);
   const modes = result.modes || [];
-  const hot = result.hotSwitch?.status || 'not-tested';
-  const strict = modes.find(m => m.mode === 'strict');
   const roles = [...new Set(modes.flatMap(m => (m.requests || []).flatMap(r => r.roles || [])))].join(' + ');
-  const residual = strict?.requests?.some(r => r.identityLines?.length);
-  const assessment = verificationEvidence(result);
-  const details = modes.length ? node('details', {}, node('summary', {}, `${modes.length} 种模式的请求证据`), modes.map(m => node('p', { class: 'help' }, `${MODE_LABELS[m.mode] || m.mode} · ${CAPTURE_LABELS[m.status] || m.status}：`, m.reason || '', (m.requests || []).map(r => `${(r.roles || []).join('+')} / ${r.chars}字 / 人设${r.markerCount}次 / 身份句${r.identityLines?.length || 0} / 工具${r.toolDefinitions}`).join('；')))) : null;
+  const hot = result.hotSwitch?.status;
   return node('tr', {},
-    node('td', {}, node('strong', {}, result.harness), node('p', { class: 'muted' }, result.version || '版本未知'), node('p', { class: 'help' }, captureScopeLabel(result.scope))),
+    node('td', {}, node('strong', {}, harnessTitle(result.harness)), node('div', { class: 'hint' }, result.version || pick('版本未知', 'Unknown version'))),
+    node('td', {}, chip(ev.label, ev.chipClass)),
     node('td', {}, roles || '—'),
-    node('td', {}, badge(assessment.label, assessment.kind), residual && node('p', { class: 'help' }, '仍有固定身份句')),
-    node('td', {}, badge(CAPTURE_LABELS[hot] || hot, hot === 'passed' ? 'good' : ''), hot === 'passed' && node('p', { class: 'help' }, `${captureScopeLabel(result.hotSwitch?.scope)} · A → B → ${MODE_LABELS.strict} → ${MODE_LABELS.off}`)),
-    node('td', {}, result.reason || (!modes.length ? result.evidence || '' : ''), result.hotSwitch?.reason && node('p', { class: 'help' }, result.hotSwitch.reason), details));
+    node('td', {},
+      result.reason || (!modes.length ? result.evidence || '' : ''),
+      hot ? node('div', { class: 'hint' }, pick(`同会话热切：${CAPTURE_LABELS[hot] || hot}`, `In-session hot-switch: ${CAPTURE_LABELS[hot] || hot}`)) : null,
+      modes.length ? node('details', { class: 'fine' },
+        node('summary', {}, pick(`${modes.length} 种力度的请求证据`, `Request evidence for ${modes.length} mode(s)`)),
+        node('div', { class: 'fine-body' }, modes.map(m => node('p', {},
+          `${MODE_LABELS[m.mode] || m.mode} · ${CAPTURE_LABELS[m.status] || m.status}${pick('：', ': ')}${m.reason || ''} `,
+          (m.requests || []).map(r => pick(
+            `${(r.roles || []).join('+')} / ${r.chars} 字 / 人设 ${r.markerCount} 次 / 身份句 ${r.identityLines?.length || 0}`,
+            `${(r.roles || []).join('+')} / ${r.chars} chars / persona ×${r.markerCount} / identity lines ${r.identityLines?.length || 0}`,
+          )).join(pick('；', '; '))
+        )))
+      ) : null
+    )
+  );
 }
+
+function captureSummary(report) {
+  const results = report.results || [];
+  const hits = results.filter(r => ['verified', 'off-verified'].includes(evidenceOf(r).state)).length;
+  const missing = results.filter(r => ['no-request', 'unavailable', 'miss'].includes(evidenceOf(r).state)).length;
+  return pick(
+    `最近一次在临时环境里试了 ${results.length} 个工具：${hits} 个在请求里命中了人设${missing ? `，${missing} 个没抓到或没命中` : ''}。`,
+    `Last isolated test ran ${results.length} tool(s): ${hits} hit the persona${missing ? `, ${missing} had no request or missed` : ''}.`,
+  );
+}
+
 async function loadCapture() {
   try {
     capture = await api('verification');
     const report = capture.report;
-    const command = node('p', { class: 'help' }, '重新验证：', node('code', {}, 'npm run test:harness'));
-    $('capture-results').replaceChildren(...(!report ? [node('p', { class: 'muted' }, '暂无请求捕获报告。测试使用隔离配置和本地服务，不以模型自报身份作为证据。'), command] : [
-      node('p', { class: 'help path' }, `${report.at} · 历史独立测试，不代表当前会话 · ${report.reportPath || ''}`),
-      node('p', { class: 'help' }, '这是隔离测试，不是当前桌面会话。未捕获请求不等于人设未命中；命中也不证明模型行为符合人设。暂停模式单独判定。'),
-      node('div', { class: 'table-scroll' }, node('table', { class: 'capture-table' }, node('thead', {}, node('tr', {}, ['执行器 / 版本', '实际角色', '请求捕获', '同会话热切', '证据 / 原因'].map(label => node('th', {}, label)))), node('tbody', {}, report.results.map(captureRow)))), command]));
-  } catch (error) { $('capture-results').textContent = `报告读取失败：${error.message}`; }
+    const command = node('p', { class: 'hint' }, pick('重新试跑：', 'Re-run: '), node('code', {}, 'npm run test:harness'));
+    $('capture-results').replaceChildren(...(!report ? [node('p', { class: 'muted' }, pick('还没有试跑报告。试跑使用临时配置和本地服务，不以模型自称的身份作为证据。', 'No verification report yet. Tests use isolated configs and a local fixture server, never model self-reports.')), command] : [
+      node('p', { class: 'muted' }, captureSummary(report)),
+      node('p', { class: 'hint' }, pick(`${report.at || ''} · 临时环境。这不代表你正在用的窗口已经生效。`, `${report.at || ''} · Isolated environment. Does not reflect your active windows.`)),
+      node('div', { class: 'table-scroll' }, node('table', { class: 'capture-table' },
+        node('thead', {}, node('tr', {}, [pick('工具 / 版本', 'Tool / Version'), pick('结果', 'Result'), pick('注入层', 'Layer'), pick('说明', 'Details')].map(label => node('th', {}, label)))),
+        node('tbody', {}, report.results.map(captureRow))
+      )),
+      command
+    ]));
+  } catch (error) { $('capture-results').textContent = pick(`报告读取失败：${error.message}`, `Failed to load report: ${error.message}`); }
 }
-const pageFromHash = () => ({ personas: 'library', overview: 'console' }[location.hash.slice(1)] || location.hash.slice(1) || 'console');
+
+/* ---------------- project & global rules ---------------- */
+let ruleScope = 'project';
+let rulePersona = '';
+
+async function loadProject(dir = '') {
+  $('project-targets').replaceChildren(empty(t('project.loading')));
+  $('project-dir-wrap').hidden = ruleScope === 'global';
+  $('project-scope-heading').textContent = ruleScope === 'global' ? t('project.scopeGlobalHeading') : t('project.scopeProjectHeading');
+  $('project-scope-desc').textContent = t('project.scopeDesc');
+  document.querySelectorAll('[name="rule-scope"]').forEach(el => { el.checked = el.value === ruleScope; });
+  try {
+    const params = new URLSearchParams();
+    if (ruleScope === 'global') params.set('scope', 'global');
+    else if (dir) params.set('dir', dir);
+    if (rulePersona) params.set('persona', rulePersona);
+    const qs = params.toString();
+    project = await api(`project${qs ? `?${qs}` : ''}`);
+    if (project.dir) $('project-dir').value = project.dir;
+    renderProject();
+  } catch (error) {
+    project = null;
+    $('project-targets').replaceChildren(node('p', { class: 'empty' }, error.message));
+  }
+}
+
+function renderProject() {
+  if (!project) return;
+  const scope = project.scope === 'global' ? 'global' : 'project';
+  const persona = state?.personas?.find(p => p.id === project.persona);
+  const selectedPersonaTitle = persona ? personaName(persona) : pick('当前人设', 'Current persona');
+  const projects = scope === 'global' ? [] : (project.projects?.length ? project.projects : project.recent.map(dir => ({ dir, current: dir === project.dir, files: 0, written: 0 })));
+  $('project-recent').replaceChildren(...projects.map(item =>
+    node('button', {
+      type: 'button',
+      class: 'recent-chip project-recent-item',
+      'data-project-dir': item.dir,
+      title: item.dir,
+      'aria-current': item.current ? 'true' : 'false'
+    },
+      node('span', { class: 'project-recent-path' }, item.dir),
+      node('span', { class: 'project-recent-count' }, item.current ? pick('当前', 'Current') : item.files ? pick(`${item.written}/${item.files} 已写入`, `${item.written}/${item.files} written`) : pick('未写入', 'Not written'))
+    )
+  ));
+  const cards = project.targets.map(target => {
+    const readers = target.tools || [];
+    const on = Boolean(target.on);
+    const hasBlock = Boolean(target.hasBlock);
+    const pending = !on && Boolean(target.selected) && project.paused;
+    const blocked = hasBlock && !on;
+    const canWrite = !hasBlock && !project.paused && Boolean(project.persona) && readers.length > 0;
+    const canUpdate = on && !project.paused && Boolean(project.persona) && target.writtenPersona !== project.persona;
+    const action = on || pending ? 'off' : 'on';
+    const writeLabel = scope === 'global' ? pick('写入全局文件', 'Write Global File') : pick('写入此项目', 'Write to Project');
+    const label = on ? pick('移除', 'Remove') : pending ? pick('取消选择', 'Deselect') : blocked ? pick('处理现有块', 'Resolve Existing Block') : writeLabel;
+    const disableAction = blocked || (!on && !pending && !canWrite);
+    const actionButton = node('button', {
+      type: 'button',
+      class: `btn ${on || pending ? 'btn-ghost' : 'btn-ink'}`,
+      'data-project-action': action,
+      'data-project-file': target.file,
+      'data-project-id': target.id || '',
+      disabled: disableAction
+    }, label);
+    const updateButton = canUpdate ? node('button', {
+      type: 'button',
+      class: 'btn btn-primary',
+      'data-project-action': 'on',
+      'data-project-file': target.file,
+      'data-project-id': target.id || ''
+    }, pick(`更新为「${selectedPersonaTitle}」`, `Update to "${selectedPersonaTitle}"`)) : null;
+    const writtenLabel = target.writtenPersonaName ? pick(`已写入 · ${target.writtenPersonaName}`, `Written · ${target.writtenPersonaName}`) : pick('已写入', 'Written');
+    const status = on ? writtenLabel : blocked ? pick('归属不明', 'Unknown owner') : pending ? pick('已暂停', 'Paused') : target.selected ? pick('待写入', 'Pending') : pick('未写入', 'Not written');
+    const diff = target.diff;
+    const diffSummary = diff ? (diff.added || diff.removed ? pick(`查看写入差异 · +${diff.added} / -${diff.removed}`, `View diff · +${diff.added} / -${diff.removed}`) : pick('查看写入差异 · 没有变化', 'View diff · No changes')) : null;
+    const scopeNote = on
+      ? pick(
+        `已写入${target.writtenPersonaName ? `「${target.writtenPersonaName}」` : ''}，追加在原文件末尾（append），随时可移除。`,
+        `Written${target.writtenPersonaName ? ` "${target.writtenPersonaName}"` : ''} as an appended block at the end of the file; removable anytime.`,
+      )
+      : pick('保留原有规则并在末尾追加（append）托管块，对所有读取方生效。', 'Preserves existing rules and appends a managed block at the end for all reading tools.');
+    return node('article', { class: 'project-card', 'data-project-card': target.file },
+      node('div', { class: 'project-card-head' },
+        node('div', {},
+          node('h2', {}, target.file),
+          node('p', { class: 'project-path' }, target.path)
+        ),
+        chip(status, on ? 'is-on' : blocked || pending ? 'is-warn' : '')
+      ),
+      node('p', { class: 'project-readers' }, readers.length ? pick(`读取方：${listJoin(readers.map(id => harnessTitle(id)))}`, `Read by: ${listJoin(readers.map(id => harnessTitle(id)))}`) : pick('没有已登记的工具读取这个文件', 'No registered tools read this file')),
+      node('p', { class: 'project-scope-note' }, scopeNote),
+      node('div', { class: 'project-controls' }, updateButton, actionButton),
+      target.gitHint && (on || hasBlock) ? node('p', { class: 'hint' }, target.gitHint) : null,
+      blocked ? node('p', { class: 'hint' }, pick('文件里有 agent-purge 托管块，但账本里找不到归属；先手动核对，避免误删。', 'File contains an agent-purge block not found in the ledger; inspect manually to avoid accidental deletion.')) : null,
+      !on && !hasBlock && !project.persona ? node('p', { class: 'hint' }, pick('先在「控制台」或「人设库」选一份人设，才能写入。', 'Select a persona in Console or Personas first to write.')) : null,
+      !on && !hasBlock && project.paused ? node('p', { class: 'hint' }, pick('全局暂停中：恢复后会按当前选择写回；现在只取消选择。', 'Global pause active: selection will write back on resume; deselecting only for now.')) : null,
+      target.preview ? node('details', { class: 'project-preview' },
+        node('summary', {}, pick(`查看托管块 · ${fmt(target.preview.chars)} 字`, `View managed block · ${fmt(target.preview.chars)} chars`)),
+        node('pre', {}, target.preview.text + (target.preview.truncated ? '\n…' : ''))
+      ) : null,
+      diff ? node('details', { class: 'project-preview project-diff' },
+        node('summary', {}, diffSummary),
+        node('pre', {}, diff.text)
+      ) : null,
+      target.after != null ? node('details', { class: 'project-preview project-after' },
+        node('summary', {}, pick(`写入后的规则文件 · ${fmt(target.afterChars)} 字`, `Resulting rule file · ${fmt(target.afterChars)} chars`)),
+        node('pre', {}, target.after + (target.afterTruncated ? '\n…' : ''))
+      ) : null
+    );
+  });
+  const toolRows = project.targets
+    .flatMap(target => (target.tools || []).map(id => ({
+      id,
+      file: target.file,
+      on: Boolean(target.on),
+      hasBlock: Boolean(target.hasBlock),
+      selected: Boolean(target.selected)
+    })))
+    .sort((a, b) => harnessTitle(a.id).localeCompare(harnessTitle(b.id), isZh() ? 'zh-CN' : 'en'));
+  const coverage = node('details', { class: 'project-coverage' },
+    node('summary', {}, pick(`按工具查看读取关系 · ${toolRows.length} 家`, `Per-tool file mapping · ${toolRows.length} tool(s)`)),
+    node('div', { class: 'project-coverage-list' }, ...toolRows.map(row => node('div', { class: 'project-coverage-row' },
+      node('strong', {}, harnessTitle(row.id)),
+      node('span', { class: 'project-coverage-file' }, pick(`读取 ${row.file}`, `Reads ${row.file}`)),
+      node('span', { class: 'project-coverage-state' }, row.on ? pick('已写入', 'Written') : row.hasBlock ? pick('归属不明', 'Unknown') : project.paused && row.selected ? pick('已暂停', 'Paused') : pick('未写入', 'Not written'))
+    )))
+  );
+  const history = (project.history || []).map(row => {
+    const at = new Date(row.at);
+    const when = Number.isNaN(at.getTime()) ? String(row.at ?? '') : fmtDateTime(at, { hour12: false });
+    const who = row.persona ? (state?.personas?.find(p => p.id === row.persona) ? personaName(state.personas.find(p => p.id === row.persona)) : row.persona) : pick('未记录人设', 'Unknown persona');
+    return node('div', { class: 'project-history-row' },
+      node('span', { class: 'project-history-time' }, when),
+      node('strong', {}, row.file || pick('规则文件', 'Rule file')),
+      node('span', {}, `${row.action === 'remove' ? pick('移除', 'Remove') : pick('写入', 'Write')} · ${who}`),
+      node('span', { class: row.ok === false ? 'project-history-state is-failed' : 'project-history-state' }, row.ok === false ? pick('失败', 'Failed') : pick('完成', 'Done'))
+    );
+  });
+  const historyPanel = history.length ? node('details', { class: 'project-history' },
+    node('summary', {}, pick(`本页操作记录 · ${history.length} 条`, `Page activity log · ${history.length}`)),
+    node('div', { class: 'project-history-list' }, ...history)
+  ) : null;
+  $('project-targets').replaceChildren(
+    node('p', { class: 'project-persona' },
+      persona
+        ? pick(`当前待写入人设：${personaName(persona)}（${rulePersona ? '本页指定' : '跟随控制台'}）`, `Persona to write: ${personaName(persona)} (${rulePersona ? 'page override' : 'follows Console'})`)
+        : pick('还没有选中人设；规则文件只能预览，不能写入。', 'No persona selected; rule files can only be previewed.')
+    ),
+    ...cards,
+    coverage,
+    ...(historyPanel ? [historyPanel] : [])
+  );
+}
+/* ---------------- navigation ---------------- */
+const pageFromHash = () => ({ personas: 'library', overview: 'console', rules: 'project' }[location.hash.slice(1)] || location.hash.slice(1) || 'console');
 async function navigate(page, { replace = false, focus = true } = {}) {
-  if (!['console', 'library', 'diagnostics'].includes(page)) page = 'console';
+  if (!['console', 'library', 'diagnostics', 'project', 'settings'].includes(page)) page = 'console';
   if (activePage === 'library' && page !== 'library' && !confirmDiscard()) {
     history.replaceState(null, '', '#library');
     return;
   }
-  // 放弃的编辑不应在下次进入时悄悄复活。
   if (activePage === 'library' && page !== 'library' && editorDirty()) { editor = null; $('editor-form').hidden = true; $('editor-empty').hidden = false; }
+  if (page !== 'console' && expanded) closeDrawer({ restore: false });
   activePage = page;
-  document.querySelectorAll('.page').forEach(el => el.hidden = el.id !== `page-${page}`);
+  document.querySelectorAll('.page').forEach(el => { el.hidden = el.id !== `page-${page}`; });
+  pulseClass($(`page-${page}`), 'is-entering', 360);
   document.querySelectorAll('[data-page]').forEach(el => el.setAttribute('aria-current', el.dataset.page === page ? 'page' : 'false'));
+  if (page === 'library' && editor === null && state?.active) openEditor(state.active);
   if (replace || location.hash !== `#${page}`) history[replace ? 'replaceState' : 'pushState'](null, '', `#${page}`);
   if (focus) $('main').focus({ preventScroll: true });
   if (page === 'diagnostics') await loadCapture();
+  if (page === 'project') await loadProject(ruleScope === 'project' ? (project?.dir || '') : '');
+  if (page === 'settings') renderSettings();
 }
 window.addEventListener('hashchange', () => navigate(pageFromHash(), { replace: true }));
 document.querySelectorAll('[data-page]').forEach(el => el.addEventListener('click', () => navigate(el.dataset.page)));
-$('current-sync').addEventListener('click', e => { e.preventDefault(); navigate('diagnostics'); });
 document.querySelector('.brand').addEventListener('click', e => { e.preventDefault(); navigate('console'); });
-$('persona-select').addEventListener('change', () => { draft.persona = $('persona-select').value; renderConfigControls(); });
-document.querySelectorAll('[name=mode]').forEach(el => el.addEventListener('change', () => { draft.mode = mode(); renderConfigControls(); }));
-$('reset-config').addEventListener('click', () => { draft = { ...base }; draftConflict = false; render(); });
-$('config-form').addEventListener('submit', e => { e.preventDefault(); operation(async () => { const result = await api('apply', { persona: draft.persona, mode: state.paused ? 'off' : draft.mode, ...(state.defaultsSet === false ? { harness: state.defaults.harness } : {}), ...(state.paused ? { resumeMode: draft.mode } : {}) }); await refresh({ resetDraft: result.ok === true }); announce(result, state.paused ? '选择已保存，仍保持暂停。' : '变更已应用。请按各通道提示检查生效时机。'); }); });
-$('power').addEventListener('click', () => operation(async () => { const on = state.paused; const result = await api('power', { on }); await refresh(); announce(result, on ? '已恢复原选择范围。' : '已暂停；静态内容已撤下，旧会话可能需要重开。'); }));
-$('disarm-all').addEventListener('click', () => {
-  if (!window.confirm('确定撤销所有已登记的接管吗？\n\n- 暂停：撤下静态内容并保留通道选择；\n- 完全还原：撤销托管配置、插件与同名命令，保留人设和用户修改；恢复冲突会保留凭据并报错。\n\n这不会卸载 agent-purge 程序本身。')) return;
+$('project-load').addEventListener('click', () => loadProject($('project-dir').value.trim()));
+$('project-cwd').addEventListener('click', () => loadProject(project?.cwd || ''));
+$('project-dir').addEventListener('keydown', e => {
+  if (e.key !== 'Enter') return;
+  e.preventDefault();
+  loadProject($('project-dir').value.trim());
+});
+$('project-recent').addEventListener('click', e => {
+  const chip = e.target.closest('[data-project-dir]');
+  if (chip) loadProject(chip.dataset.projectDir);
+});
+document.querySelectorAll('[name="rule-scope"]').forEach(el => el.addEventListener('change', () => {
+  ruleScope = el.value === 'global' ? 'global' : 'project';
+  loadProject(ruleScope === 'project' ? (project?.dir || '') : '');
+}));
+$('project-persona-select').addEventListener('change', e => {
+  rulePersona = e.target.value;
+  loadProject(ruleScope === 'project' ? (project?.dir || '') : '');
+});
+
+/* ---------------- settings ---------------- */
+function renderSettings() {
+  const s = state?.settings;
+  if (!s) return;
+  if ($('language-select')) $('language-select').value = s.language || 'auto';
+  if ($('theme-select')) $('theme-select').value = s.theme || 'auto';
+  const desktop = s.desktop || {};
+  const webdav = s.webdav || {};
+  $('close-action').value = desktop.exitOnClose === false ? 'stay' : 'exit';
+  $('confirm-close').checked = desktop.confirmOnClose !== false;
+  const badge = $('desktop-mode-badge');
+  const managed = Boolean(state.settingsDesktop?.managed);
+  badge.textContent = managed ? pick('桌面端 · 窗口形态', 'Desktop · Window') : pick('终端托管', 'Terminal Managed');
+  badge.className = `pill ${managed ? 'is-good' : ''}`;
+  $('desktop-mode-badge').title = managed
+    ? pick('双击 exe / 桌面图标启动：关闭窗口的行为由下面这项决定', 'Launched via desktop shortcut / executable: window close behavior is controlled below')
+    : pick('当前是命令行启动的 web 服务，关窗退出不适用（由终端托管）', 'Launched from CLI; window-close exit does not apply (managed by terminal)');
+
+  $('webdav-url').value = webdav.url || '';
+  $('webdav-dir').value = webdav.dir || 'agent-purge';
+  $('webdav-username').value = webdav.username || '';
+  $('webdav-password').value = '';
+  $('webdav-password').placeholder = webdav.hasPassword ? t('settings.webdavPasswordKeep') : t('settings.webdavPasswordUnset');
+  $('backup-stamp').textContent = webdav.lastBackupAt
+    ? pick(`上次备份 ${fmtDateTime(webdav.lastBackupAt)}`, `Last backup ${fmtDateTime(webdav.lastBackupAt)}`)
+    : pick('还没有备份过', 'No backups yet');
+}
+
+function settingsStatus(id, message, kind = '') {
+  const el = $(id);
+  if (!el) return;
+  el.textContent = message;
+  el.className = `hint${kind ? ` is-${kind}` : ''}`;
+}
+
+$('save-language')?.addEventListener('click', () => operation(async () => {
+  const result = await api('settings', { language: $('language-select').value });
+  state.settings = result.settings;
+  if (result.locale) {
+    setLocale(result.locale);
+    applyDomI18n();
+  }
+  render();
+  settingsStatus('language-status', t('settings.languageSaved'), 'good');
+  notify(t('settings.languageSaved'), 'good');
+}));
+
+$('save-theme')?.addEventListener('click', () => operation(async () => {
+  themeSeq += 1;
+  const result = await api('settings', { theme: $('theme-select').value });
+  state.settings = result.settings;
+  applyTheme(result.settings.theme);
+  renderSettings();
+  settingsStatus('theme-status', t('settings.themeSaved'), 'good');
+  notify(t('settings.themeSaved'), 'good');
+}));
+
+let themeSeq = 0;
+$('theme-toggle')?.addEventListener('click', async () => {
+  if (busy) return;
+  const seq = ++themeSeq;
+  const prev = normalizeTheme(state?.settings?.theme || document.documentElement.dataset.theme);
+  const next = resolvedTheme(prev) === 'dark' ? 'light' : 'dark';
+  applyTheme(next);
+  if (state?.settings) state.settings.theme = next;
+  if ($('theme-select')) $('theme-select').value = next;
+  try {
+    const result = await api('settings', { theme: next });
+    if (seq !== themeSeq) return;
+    if (state) state.settings = result.settings;
+    applyTheme(result.settings.theme);
+    if ($('theme-select')) $('theme-select').value = result.settings.theme;
+    settingsStatus('theme-status', '');
+  } catch (error) {
+    if (seq !== themeSeq) return;
+    if (state?.settings) state.settings.theme = prev;
+    applyTheme(prev);
+    if ($('theme-select')) $('theme-select').value = prev;
+    notify(error.message, 'error');
+  }
+});
+
+$('save-desktop')?.addEventListener('click', () => operation(async () => {
+  const result = await api('settings', {
+    desktop: { exitOnClose: $('close-action').value === 'exit', confirmOnClose: $('confirm-close').checked },
+  });
+  state.settings = result.settings;
+  renderSettings();
+  settingsStatus('desktop-status', pick('已保存；下一次关窗就按新方式处理。', 'Saved; applies on next window close.'));
+  notify(pick('窗口设置已保存。', 'Window settings saved.'), 'good');
+}));
+
+async function saveWebdav({ test = false } = {}) {
+  const payload = { webdav: { url: $('webdav-url').value.trim(), dir: $('webdav-dir').value.trim(), username: $('webdav-username').value.trim() } };
+  const password = $('webdav-password').value;
+  if (password) payload.webdav.password = password;
+  const saved = await api('settings', payload);
+  state.settings = saved.settings;
+  $('webdav-password').value = '';
+  renderSettings();
+  if (!test) return saved;
+  const result = await api('webdav', { action: 'test' });
+  settingsStatus('webdav-status', result.willCreateDir
+    ? pick(`连接正常（首次备份时将自动创建目录）：${result.url}`, `Connected (remote dir will be created on first backup): ${result.url}`)
+    : pick(`连接正常：${result.url}`, `Connected: ${result.url}`), 'good');
+  return saved;
+}
+
+async function runWebdavUi(pendingText, work) {
+  settingsStatus('webdav-status', pendingText);
+  try {
+    return await work();
+  } catch (error) {
+    settingsStatus('webdav-status', error.message, 'bad');
+    throw error;
+  }
+}
+
+$('webdav-save')?.addEventListener('click', () => operation(() => runWebdavUi(pick('正在测试连接…', 'Testing connection…'), async () => {
+  await saveWebdav({ test: true });
+  notify(pick('WebDAV 设置已保存，连接正常。', 'WebDAV settings saved; connection OK.'), 'good');
+})));
+
+$('webdav-backup')?.addEventListener('click', () => operation(() => runWebdavUi(pick('正在备份…', 'Backing up…'), async () => {
+  await saveWebdav();
+  const result = await api('webdav', { action: 'backup' });
+  state.settings = (await api('settings')).settings;
+  renderSettings();
+  settingsStatus('webdav-status', pick(`已备份 ${result.files} 个文件（${fmt(result.bytes)} 字节）→ ${result.remote}`, `Backed up ${result.files} file(s) (${fmt(result.bytes)} bytes) → ${result.remote}`), 'good');
+  notify(pick('备份完成。', 'Backup complete.'), 'good');
+})));
+
+$('webdav-restore')?.addEventListener('click', () => operation(async () => {
+  if (!$('webdav-url').value.trim()) throw new Error(pick('先填 WebDAV 地址', 'Enter WebDAV URL first'));
+  if (!confirm(pick('恢复会用远端备份覆盖本机的人设与设置（会先在本地 backups/ 留一份快照）。继续？', 'Restore will overwrite local personas and settings with the remote backup (a local snapshot will be saved in backups/ first). Continue?'))) return;
+  await runWebdavUi(pick('正在恢复…', 'Restoring…'), async () => {
+    await saveWebdav();
+    const result = await api('webdav', { action: 'restore', confirm: true });
+    await refresh({ resetDraft: true });
+    renderSettings();
+    settingsStatus('webdav-status', pick(`已恢复 ${result.written.length} 个文件；本地快照：${result.snapshot || '未创建'}`, `Restored ${result.written.length} file(s); local snapshot: ${result.snapshot || 'none'}`), 'good');
+    notify(pick('已从备份恢复，请检查人设与设置。', 'Restored from backup; please review personas and settings.'), 'good');
+  });
+}));
+$('project-targets').addEventListener('click', e => {
+  const btn = e.target.closest('[data-project-action]');
+  if (!btn || btn.disabled || !project) return;
+  const file = btn.dataset.projectFile;
+  const id = btn.dataset.projectId || '';
+  const action = btn.dataset.projectAction;
+  const scope = project.scope === 'global' ? 'global' : 'project';
   operation(async () => {
-    const res = await api('clean', {});
-    await refresh();
-    if (res.ok) notify('已撤销登记的接管，人设和用户修改已保留。', 'good');
-    else notify(`部分项目撤销失败：${(res.leftovers || []).join('；')}`, 'warn');
+    const sha = project?.targets?.find(t => t.file === file && (!id || t.id === id))?.sha ?? null;
+    const result = await api('project', {
+      scope,
+      ...(scope === 'project' ? { dir: project.dir } : { id }),
+      file,
+      action,
+      sha,
+      ...(rulePersona ? { persona: rulePersona } : {}),
+    });
+    project = result.view;
+    renderProject();
+    announce(result.results ?? result.result, result.ok
+      ? (action === 'on' ? pick(`${file} 已写入（追加托管块），随时可移除。`, `${file} updated (managed block appended); removable anytime.`) : pick(`${file} 的托管块已移除。`, `Managed block removed from ${file}.`))
+      : pick('规则文件未改变。', 'Rule file unchanged.'));
   });
 });
-$('refresh').addEventListener('click', () => operation(async () => { await refresh(); notify('状态已刷新，未保存的草稿保持不变。'); }));
+
+/* ---------------- console events ---------------- */
+$('persona-select').addEventListener('change', () => {
+  draft.persona = $('persona-select').value;
+  const p = state.personas.find(p => p.id === draft.persona);
+  $('current-persona').textContent = personaName(p);
+  $('current-mode').textContent = pick(`${fmt(p?.chars)} 字 · ${state.personas.length} 份可用`, `${fmt(p?.chars)} chars · ${state.personas.length} available`);
+  $('persona-description').textContent = p?.meta?.description || p?.meta?.desc || pick('这份人设没有写说明。', 'No description for this persona.');
+  pulseClass($('current-persona'), 'is-swapping', 400);
+  pulseClass(document.querySelector('.command-bar'), 'is-wiping', 560);
+  renderConfigControls();
+});
+document.querySelectorAll('[name=mode]').forEach(el => el.addEventListener('change', () => { draft.mode = mode(); renderConfigControls(); }));
+$('quick-pull-btn')?.addEventListener('click', () => openImportDialog());
+$('quick-new-btn')?.addEventListener('click', () => { navigate('library'); $('new-persona')?.click(); });
+$('edit-current').addEventListener('click', () => { openEditor(draft.persona); navigate('library'); });
+$('new-persona').addEventListener('click', () => openEditor(''));
+
+$('batch-actions-select')?.addEventListener('change', async e => {
+  const val = e.target.value;
+  if (!val) return;
+  e.target.value = '';
+  operation(async () => {
+    if (val === 'enable-ready') {
+      const ready = state.harnesses.filter(h => h.supported && installed(h) && !disabledHere(h) && !consoleOn(h));
+      const done = [];
+      for (const h of ready) {
+        const channel = ['install', 'slash', 'shim'].find(c => h.caps?.[c]?.ok);
+        if (!channel) continue;
+        await api('arm', { harness: h.id, channel, action: 'on' });
+        done.push(harnessTitle(h.id));
+      }
+      await refresh();
+      notify(done.length ? pick(`已开启：${listJoin(done)}。`, `Enabled: ${listJoin(done)}.`) : pick('没有可以一键开启的工具。', 'No ready tools to enable.'), done.length ? 'good' : '');
+    } else if (val === 'disable-all') {
+      $('disarm-all')?.click();
+    } else if (val === 'mode-preferred') {
+      const active = state.harnesses.filter(h => h.supported && consoleOn(h));
+      for (const h of active) {
+        const avail = modeAvailability(h);
+        const target = avail.preferred || (avail.supported.has('replace') ? 'replace' : 'append');
+        await api('harness', { harness: h.id, mode: target });
+      }
+      await refresh();
+      notify(pick('已恢复各家推荐的改写力度。', 'Restored recommended modes.'), 'good');
+    } else if (val === 'mode-replace' || val === 'mode-strict') {
+      const target = val === 'mode-replace' ? 'replace' : 'strict';
+      const active = state.harnesses.filter(h => h.supported && consoleOn(h) && modeAvailability(h).supported.has(target));
+      for (const h of active) await api('harness', { harness: h.id, mode: target });
+      await refresh();
+      notify(pick(`已把 ${active.length} 个工具改为「${MODE_LABELS[target]}」。`, `Set ${active.length} tool(s) to "${MODE_LABELS[target]}".`), 'good');
+    }
+  });
+});
+
+$('reset-config').addEventListener('click', () => { draft = { ...base }; draftConflict = false; render(); });
+$('config-form').addEventListener('submit', e => {
+  e.preventDefault();
+  operation(async () => {
+    $('apply').textContent = t('console.applying');
+    const result = await api('apply', {
+      persona: draft.persona,
+      mode: state.paused ? 'off' : draft.mode,
+      ...(state.defaultsSet === false ? { harness: state.defaults.harness } : {}),
+      ...(state.paused ? { resumeMode: draft.mode } : {})
+    });
+    await refresh({ resetDraft: result.ok === true });
+    pulseClass(document.querySelector('.command-bar'), 'is-wiping', 560);
+    pulseClass($('coverage-strip'), 'is-updating', 600);
+    announce(result, state.paused ? pick('配置已保存，当前仍处于暂停状态。', 'Configuration saved; still paused.') : pick('已应用。新开的会话会读取，运行中的会话看各家提示。', 'Applied. New sessions will pick it up; check tool notes for running sessions.'));
+  });
+});
+$('power').addEventListener('click', () => operation(async () => {
+  const on = state.paused;
+  const result = await api('power', { on });
+  await refresh();
+  announce(result, on ? pick('已恢复全部工具的人设注入。', 'Resumed persona injection for all tools.') : pick('已暂停全部工具；现有配置已安全复原。', 'Paused all tools; original configurations restored safely.'));
+}));
+$('disarm-all').addEventListener('click', () => {
+  if (!window.confirm(pick(
+    '停用所有已接管的工具？\n\n会撤销系统提示词配置、插件与命令别名，并按原字节还原原厂文件。\n项目规则不在其中，需到「项目规则」页单独移除。\n人设和用户修改会保留，不会卸载 agent-purge 本身。',
+    'Disable all managed tools?\n\nThis will revoke system prompt configs, plugins, and CLI shims, restoring original files byte-for-byte.\nProject rule files are not included—remove them on the Rule Files page.\nYour personas and custom edits are preserved; agent-purge itself is not uninstalled.',
+  ))) return;
+  operation(async () => {
+    const res = await api('clean', { keepProject: true });
+    await refresh();
+    if (res.ok) notify(pick('已撤销全部接管：原厂文件已还原，人设和用户修改已保留。', 'All targets disarmed: original files restored, personas and edits kept.'), 'good');
+    else notify(pick(`部分项目撤销失败：${(res.leftovers || []).join('；')}`, `Some items failed to disarm: ${(res.leftovers || []).join('; ')}`), 'warn');
+  });
+});
+$('refresh').addEventListener('click', () => operation(async () => { await refresh(); notify(pick('状态已刷新，未保存的选择保持不变。', 'Status refreshed; unsaved selections kept.')); }));
 $('show-all').addEventListener('change', renderHarnesses);
-const toggleExpand = id => { expanded = expanded === id ? null : id; renderHarnesses(); };
-$('harness-list').addEventListener('click', e => {
-  const closeBtn = e.target.closest('[data-close-drawer]');
-  if (closeBtn) { toggleExpand(null); return; }
+
+const setHarnessArmed = async (id, on, resetCheckbox = null) => {
+  if (on && ['workbuddy', 'workbuddy-ai', 'antigravity', 'zcode'].includes(id)) {
+    const confirmed = await confirmHarnessArm(id);
+    if (!confirmed) {
+      if (resetCheckbox) resetCheckbox.checked = false;
+      return;
+    }
+  }
+  operation(async () => {
+    const result = await api('arm', { harness: id, channel: 'auto', action: on ? 'on' : 'off' });
+    await refresh();
+    pulseClass(document.querySelector(`.tool-card[data-id="${CSS.escape(id)}"]`), 'is-toggled', 520);
+    pulseClass($('coverage-strip'), 'is-updating', 600);
+    announce(result, on ? pick(`${harnessTitle(id)} 已开启接管。`, `${harnessTitle(id)} enabled.`) : pick(`${harnessTitle(id)} 已停止接管并还原原厂文件。`, `${harnessTitle(id)} disabled and original files restored.`));
+  });
+};
+
+const onToolsClick = async e => {
+  if (e.target.closest('#close-drawer')) { closeDrawer(); return; }
   if (e.target.closest('.switch')) return;
+  const drawerToggle = e.target.closest('[data-drawer-toggle]');
+  if (drawerToggle) {
+    const id = drawerToggle.dataset.drawerToggle;
+    const h = state?.harnesses?.find(item => item.id === id);
+    if (h) await setHarnessArmed(id, !consoleOn(h));
+    return;
+  }
   const verifyBtn = e.target.closest('[data-verify]');
   if (verifyBtn) {
     const id = verifyBtn.dataset.verify;
     operation(async () => {
+      notify(pick(`正在临时环境里试跑 ${harnessTitle(id)}，最多等一分钟…`, `Testing ${harnessTitle(id)} in an isolated environment (up to 1 min)…`), 'muted');
       const r = await api('verify', { harness: id });
       try { capture = await api('verification'); } catch { /* 报告读不到就保持旧的 */ }
       await refresh();
-      const assessment = r.assessment || verificationEvidence(captureFor(id));
-      const where = r.roles?.join('+') || '角色未记录';
-      notify(`${id}：${assessment.label} · ${captureScopeLabel(r.scope)}${assessment.state === 'verified' ? ` · ${where}，${r.chars ?? 0} 字` : ''}${r.reason ? `；${r.reason}` : ''}。不代表当前会话已应用。`, ['verified', 'off-verified'].includes(assessment.state) ? '' : 'warn');
+      const ev = r.assessment ? (evidenceMap()[r.assessment.state]?.[0] || r.assessment.label) : evidenceOf(captureFor(id)).label;
+      notify(pick(
+        `${harnessTitle(id)}：${ev} · ${whereLabel(r.scope)}${r.reason ? `；${r.reason}` : ''}。不代表当前会话已生效。`,
+        `${harnessTitle(id)}: ${ev} · ${whereLabel(r.scope)}${r.reason ? `; ${r.reason}` : ''}. Does not reflect active sessions.`,
+      ), ['verified', 'off-verified'].includes(r.assessment?.state) ? 'good' : 'warn');
+    });
+    return;
+  }
+  const followMode = e.target.closest('[data-mode-follow]');
+  if (followMode) {
+    operation(async () => {
+      const result = await api('harness', { harness: followMode.dataset.modeFollow, mode: 'follow' });
+      await refresh();
+      announce(result, pick(`${harnessTitle(followMode.dataset.modeFollow)} 恢复跟随全局力度。`, `${harnessTitle(followMode.dataset.modeFollow)} now follows global mode.`));
+    });
+    return;
+  }
+  const copyLaunch = e.target.closest('[data-copy-launch]');
+  if (copyLaunch) {
+    const id = copyLaunch.dataset.copyLaunch;
+    const cmd = `agent-purge ${id}`;
+    navigator.clipboard?.writeText(cmd)
+      .then(() => notify(pick(`已复制：${cmd}（在这个终端里运行即带人设）`, `Copied: ${cmd} (run it in a terminal to start with the persona)`), 'good'))
+      .catch(() => notify(pick(`复制失败，手动运行：${cmd}`, `Copy failed; run it manually: ${cmd}`), 'warn'));
+    return;
+  }
+  const channelBtn = e.target.closest('[data-channel]');
+  if (channelBtn) {
+    operation(async () => {
+      const result = await api('arm', { harness: channelBtn.dataset.target, channel: channelBtn.dataset.channel, action: channelBtn.dataset.enabled === 'true' ? 'on' : 'off' });
+      await refresh();
+      pulseClass(document.querySelector(`.tool-card[data-id="${CSS.escape(channelBtn.dataset.target)}"]`), 'is-toggled', 520);
+      announce(result, pick('接管方式已更新。首次安装或更新扩展后请重新加载客户端。', 'Channel updated. Reload the client after installing or updating an extension.'));
     });
     return;
   }
   const expand = e.target.closest('[data-expand]');
-  // 行内下拉自己处理点击，不能连带展开抽屉
-  if (e.target.closest('.capsule-config')) return;
-  if (expand) { toggleExpand(expand.dataset.expand); return; }
-  const btn = e.target.closest('[data-channel]'); if (!btn) return;
-  operation(async () => { const result = await api('arm', { harness: btn.dataset.target, channel: btn.dataset.channel, action: btn.dataset.enabled === 'true' ? 'on' : 'off' }); await refresh(); announce(result, '应用范围已更新。首次加载或更新扩展后请重新加载宿主。'); });
+  if (expand) { selectTarget(expand.dataset.expand, { focusClose: e.detail === 0 }); return; }
+};
+document.querySelector('.target-console').addEventListener('click', onToolsClick);
+$('drawer-backdrop').addEventListener('click', () => closeDrawer());
+document.addEventListener('keydown', e => {
+  if (e.key === 'Escape' && expanded) {
+    e.preventDefault();
+    closeDrawer();
+  }
 });
-$('harness-list').addEventListener('change', e => {
+$('harness-search').addEventListener('input', e => {
+  targetQuery = e.target.value.trim().toLowerCase();
+  renderHarnesses();
+});
+$('harness-search').addEventListener('keydown', e => {
+  if (e.key !== 'ArrowDown') return;
+  const firstBtn = document.querySelector('.tool-card .tool-card-more');
+  if (!firstBtn) return;
+  e.preventDefault();
+  firstBtn.focus();
+});
+document.querySelectorAll('.filter-chip').forEach(btn => btn.addEventListener('click', () => {
+  targetFilter = btn.dataset.filter;
+  document.querySelectorAll('.filter-chip').forEach(chip => {
+    const active = chip === btn;
+    chip.classList.toggle('is-active', active);
+    chip.setAttribute('aria-pressed', String(active));
+  });
+  renderHarnesses();
+}));
+function confirmHarnessArm(id) {
+  const dialog = $('confirm-dialog');
+  if (!dialog || typeof dialog.showModal !== 'function') return Promise.resolve(true);
+  const purgeInfo = HARNESS_PURGE_EFFECTS[id];
+  $('confirm-harness-title').textContent = harnessTitle(id);
+  $('confirm-harness-badge').textContent = purgeInfo?.typeLabel || pick('配置托管', 'Config');
+  dialog.showModal();
+  return new Promise(resolve => {
+    let settled = false;
+    const finish = val => {
+      if (settled) return;
+      settled = true;
+      dialog.removeEventListener('close', onClose);
+      $('cancel-confirm')?.removeEventListener('click', onCancel);
+      $('close-confirm')?.removeEventListener('click', onCancel);
+      $('confirm-form')?.removeEventListener('submit', onSubmit);
+      resolve(val);
+    };
+    const onCancel = e => { e?.preventDefault(); dialog.close(); finish(false); };
+    const onSubmit = e => { e?.preventDefault(); dialog.close(); finish(true); };
+    const onClose = () => finish(false);
+    $('cancel-confirm')?.addEventListener('click', onCancel);
+    $('close-confirm')?.addEventListener('click', onCancel);
+    $('confirm-form')?.addEventListener('submit', onSubmit);
+    dialog.addEventListener('close', onClose, { once: true });
+  });
+}
+
+const onToolsChange = async e => {
   const el = e.target;
-  const hp = el.dataset.hpersona, hm = el.dataset.hmode;
-  if (hp) {
-    const pick = el.value;
-    operation(async () => { const result = await api('harness', { harness: hp, persona: pick || 'follow' }); await refresh(); announce(result, pick ? `${hp} 换用 ${pick}。` : `${hp} 恢复跟随全局人设。`); });
+  if (el.dataset.hpersona) {
+    // 这里不能叫 pick：块级同名声明会把模块级导入的 pick() 遮蔽成字符串，调用时抛 "pick is not a function"
+    const value = el.value;
+    operation(async () => {
+      const result = await api('harness', { harness: el.dataset.hpersona, persona: value || 'follow' });
+      await refresh();
+      announce(result, value ? pick(`${harnessTitle(el.dataset.hpersona)} 改用这份人设。`, `${harnessTitle(el.dataset.hpersona)} now uses this persona.`) : pick(`${harnessTitle(el.dataset.hpersona)} 恢复跟随全局人设。`, `${harnessTitle(el.dataset.hpersona)} now follows global persona.`));
+    });
     return;
   }
-  if (hm) {
-    const pick = el.value;
-    operation(async () => { const result = await api('harness', { harness: hm, mode: pick || 'follow' }); await refresh(); announce(result, pick ? `${hm} 模式 → ${MODE_LABELS[pick] || pick}。` : `${hm} 恢复跟随全局模式。`); });
+  if (el.dataset.hmode) {
+    const value = el.value;
+    operation(async () => {
+      const result = await api('harness', { harness: el.dataset.hmode, mode: value || 'follow' });
+      await refresh();
+      announce(result, value === 'follow' ? pick(`${harnessTitle(el.dataset.hmode)} 恢复跟随全局力度。`, `${harnessTitle(el.dataset.hmode)} now follows global mode.`) : pick(`${harnessTitle(el.dataset.hmode)} 的力度改为「${MODE_LABELS[value] || value}」。`, `${harnessTitle(el.dataset.hmode)} mode set to "${MODE_LABELS[value] || value}".`));
+    });
     return;
   }
   if (el.dataset.toggle) {
-    const id = el.dataset.toggle, on = el.checked;
-    operation(async () => { const result = await api('arm', { harness: id, channel: 'auto', action: on ? 'on' : 'off' }); await refresh(); announce(result, on ? `${id} 开始使用当前人设。` : `${id} 已恢复原样。`); });
+    await setHarnessArmed(el.dataset.toggle, el.checked, el);
     return;
   }
-  if (el.dataset.auto) operation(async () => { await api(`${el.dataset.auto}-auto`, { on: el.checked }); await refresh(); notify('自动应用设置已更新。'); });
-  if (el.dataset.profile) operation(async () => { await api('dsh-profile', { profile: el.dataset.profile, on: el.checked }); await refresh(); notify('dsh 生效形态已更新。'); });
-});
-// 标准 button/select/input 使用浏览器原生键盘语义，不拦截子控件的 Enter/Space。
-$('default-form').addEventListener('submit', e => { e.preventDefault(); operation(async () => { const result = await api('defaults', { harness: $('default-harness').value || null }); await refresh(); announce(result, '默认启动设置已保存，应用范围未改变。'); }); });
-$('edit-current').addEventListener('click', () => { openEditor(draft.persona); navigate('library'); });
-$('new-persona').addEventListener('click', () => openEditor(''));
+  if (el.dataset.auto) operation(async () => { await api(`${el.dataset.auto}-auto`, { on: el.checked }); await refresh(); notify(pick('自动应用设置已更新。', 'Auto-apply setting updated.'), 'good'); });
+  if (el.dataset.profile) operation(async () => { await api('dsh-profile', { profile: el.dataset.profile, on: el.checked }); await refresh(); notify(pick('dsh 生效形态已更新。', 'dsh profiles updated.'), 'good'); });
+};
+document.querySelector('.target-console').addEventListener('change', onToolsChange);
 
-// 外部拉取人设
-const importDialog = $('import-dialog');
-const importStatus = $('import-status');
-const importSourceInput = $('import-source');
-const startImportBtn = $('start-import');
-
-$('pull-personas')?.addEventListener('click', () => {
-  if (!importDialog) return;
-  if (!importSourceInput.value.trim()) {
-    importSourceInput.value = 'ZiChuanLan/some-magic';
-  }
-  importStatus.hidden = true;
-  importStatus.className = 'import-status';
-  importStatus.textContent = '';
-  startImportBtn.disabled = false;
-  startImportBtn.textContent = '开始拉取';
-  importDialog.showModal();
-});
-
-$('close-import')?.addEventListener('click', () => importDialog?.close());
-$('cancel-import')?.addEventListener('click', () => importDialog?.close());
-
-importDialog?.addEventListener('click', e => {
-  const pill = e.target.closest('[data-preset]');
-  if (pill) {
-    importSourceInput.value = pill.dataset.preset;
-    importSourceInput.focus();
-  }
-});
-
-$('import-form')?.addEventListener('submit', async e => {
+$('default-form').addEventListener('submit', e => {
   e.preventDefault();
-  const source = importSourceInput.value.trim();
-  if (!source) return;
-  const overwrite = $('import-overwrite').checked;
-  startImportBtn.disabled = true;
-  startImportBtn.textContent = '正在拉取…';
-  importStatus.hidden = false;
-  importStatus.className = 'import-status';
-  importStatus.textContent = `正在从 ${source} 拉取人设…`;
-
-  try {
-    const res = await api('persona/import', { source, overwrite });
-    if (!res.ok) throw new Error(res.error || '拉取失败');
-    const { total = 0, imported = [] } = res.result || {};
-    importStatus.className = 'import-status success';
-    const names = imported.map(x => x.name || x.id).slice(0, 3).join('、');
-    const suffix = imported.length > 3 ? '等' : '';
-    const detail = names ? `（${names}${suffix}）` : '';
-    importStatus.textContent = `✓ 成功导入 ${total} 个人设${detail}！`;
-    await refresh();
-    notify(`成功拉取 ${total} 个人设。`);
-    setTimeout(() => {
-      importDialog?.close();
-    }, 1200);
-  } catch (err) {
-    importStatus.className = 'import-status error';
-    importStatus.textContent = `✗ 导入失败：${err.message}`;
-    notify(`人设导入失败：${err.message}`, 'error');
-  } finally {
-    startImportBtn.disabled = false;
-    startImportBtn.textContent = '开始拉取';
-  }
+  operation(async () => { const result = await api('defaults', { harness: $('default-harness').value || null }); await refresh(); announce(result, pick('启动首选项已保存，接管范围没有改变。', 'Launch preference saved; managed targets unchanged.')); });
 });
+
+/* ---------------- library events ---------------- */
 $('persona-search').addEventListener('input', renderPersonas);
 $('persona-list').addEventListener('click', e => { const el = e.target.closest('[data-persona]'); if (el) openEditor(el.dataset.persona); });
 $('editor-form').addEventListener('input', renderEditorStatus);
 $('editor-form').addEventListener('submit', e => { e.preventDefault(); saveEditor(false); });
 $('save-apply').addEventListener('click', () => saveEditor(true));
-$('delete-persona').addEventListener('click', () => { if (!confirm(`删除人设“${editor}”？${editor === state.active ? '当前人设将回退并同步到已选范围。' : ''}`)) return; operation(async () => { const result = await api(`persona?id=${encodeURIComponent(editor)}`, null, 'DELETE'); editor = null; editorBaseline = ''; $('editor-form').hidden = true; $('editor-empty').hidden = false; await refresh({ resetDraft: true }); announce(result, '人设已删除。'); }); });
-$('sync-all').addEventListener('click', () => operation(async () => { const r = await api('sync', {}); await refresh(); announce(r, '已重新同步原范围。'); }));
-$('retry-failed').addEventListener('click', () => operation(async () => { const r = await api('sync', { onlyFailed: true }); await refresh(); announce(r, '失败项已重试。'); }));
-let cachedUpdateInfo = null;
+$('delete-persona').addEventListener('click', () => {
+  if (!confirm(pick(`删除人设「${editor}」？${editor === state.active ? '当前人设会回退并同步到已接管的工具。' : ''}`, `Delete persona "${editor}"?${editor === state.active ? ' The active persona will fall back and sync to managed tools.' : ''}`))) return;
+  operation(async () => {
+    const result = await api(`persona?id=${encodeURIComponent(editor)}`, null, 'DELETE');
+    editor = null; editorBaseline = '';
+    $('editor-form').hidden = true; $('editor-empty').hidden = false;
+    await refresh({ resetDraft: true });
+    announce(result, pick('人设已删除。', 'Persona deleted.'));
+  });
+});
 
+/* ---------------- import ---------------- */
+const importDialog = $('import-dialog');
+const importStatus = $('import-status');
+const importSourceInput = $('import-source');
+const importMirrorInput = $('import-mirror');
+const startImportBtn = $('start-import');
+function openImportDialog() {
+  if (!importDialog) return;
+  if (!importSourceInput.value.trim()) importSourceInput.value = 'ZiChuanLan/some-magic';
+  if (importMirrorInput) importMirrorInput.value = state?.settings?.githubMirror || '';
+  importStatus.hidden = true; importStatus.className = 'status-box'; importStatus.textContent = '';
+  startImportBtn.disabled = false; startImportBtn.textContent = t('import.start');
+  importDialog.showModal();
+}
+$('pull-personas')?.addEventListener('click', () => openImportDialog());
+$('close-import')?.addEventListener('click', () => importDialog?.close());
+$('cancel-import')?.addEventListener('click', () => importDialog?.close());
+importDialog?.addEventListener('click', e => {
+  const pill = e.target.closest('[data-preset]');
+  if (pill) { importSourceInput.value = pill.dataset.preset; importSourceInput.focus(); }
+});
+$('import-form')?.addEventListener('submit', async e => {
+  e.preventDefault();
+  const source = importSourceInput.value.trim();
+  if (!source) return;
+  const mirror = importMirrorInput?.value.trim() ?? '';
+  const overwrite = $('import-overwrite').checked;
+  startImportBtn.disabled = true; startImportBtn.textContent = t('import.pulling');
+  importStatus.hidden = false; importStatus.className = 'status-box';
+  importStatus.textContent = mirror
+    ? pick(`正在经镜像 ${mirror} 从 ${source} 拉取…`, `Pulling from ${source} via ${mirror}…`)
+    : pick(`正在从 ${source} 拉取…`, `Pulling from ${source}…`);
+  try {
+    const res = await api('persona/import', { source, mirror, overwrite });
+    if (!res.ok) throw new Error(res.error || pick('拉取失败', 'Pull failed'));
+    if (res.settings && state) state.settings = res.settings;
+    const { total = 0, imported = [] } = res.result || {};
+    importStatus.className = 'status-box success';
+    const names = listJoin(imported.map(x => x.name || x.id).slice(0, 3));
+    importStatus.textContent = pick(
+      `导入 ${total} 个人设${names ? `（${names}${imported.length > 3 ? ' 等' : ''}）` : ''}。`,
+      `Imported ${total} persona(s)${names ? ` (${names}${imported.length > 3 ? ', etc.' : ''})` : ''}.`,
+    );
+    await refresh();
+    notify(pick(`已拉取 ${total} 个人设。`, `Pulled ${total} persona(s).`), 'good');
+    setTimeout(() => importDialog?.close(), 1200);
+  } catch (err) {
+    importStatus.className = 'status-box error';
+    importStatus.textContent = pick(`导入失败：${err.message}`, `Import failed: ${err.message}`);
+    notify(pick(`人设导入失败：${err.message}`, `Persona import failed: ${err.message}`), 'error');
+  } finally {
+    startImportBtn.disabled = false; startImportBtn.textContent = t('import.start');
+  }
+});
+
+/* ---------------- diagnostics ---------------- */
+$('sync-all').addEventListener('click', () => operation(async () => { const r = await api('sync', {}); await refresh(); announce(r, pick('已按原范围重新同步。', 'Re-synced active targets.')); }));
+$('retry-failed').addEventListener('click', () => operation(async () => { const r = await api('sync', { onlyFailed: true }); await refresh(); announce(r, pick('失败项已重试。', 'Retried failed targets.')); }));
+
+/* ---------------- update ---------------- */
+let cachedUpdateInfo = null;
 function showUpdateDialog(res) {
   const dialog = $('update-dialog');
   if (!dialog) return;
-
-  $('update-current-tag').textContent = `当前: v${res.current}`;
-  $('update-latest-tag').textContent = `最新: v${res.latest}`;
-
+  $('update-current-tag').textContent = t('update.currentTag', { version: res.current });
+  const gitBehind = Number(res.git?.behind) || 0;
+  const sameVersion = !res.latest || res.latest === res.current;
+  $('update-latest-tag').textContent = sameVersion && gitBehind
+    ? pick(`上游 ${gitBehind} 个新提交`, `${gitBehind} upstream commit(s)`)
+    : t('update.latestTag', { version: res.latest });
   const sources = [];
   if (res.npm?.ok && res.npm?.latest === res.latest) sources.push('npm');
   if (res.github?.ok && res.github?.latest === res.latest) sources.push('GitHub');
-  $('update-source-label').textContent = sources.length ? `来源: ${sources.join(' / ')}` : '';
-
+  if (res.installType === 'git') sources.push('git');
+  $('update-source-label').textContent = sources.length ? pick(`来源 ${sources.join(' / ')}`, `via ${sources.join(' / ')}`) : '';
   const changelog = (res.github?.body || res.body || '').trim();
-  $('update-changelog-text').textContent = changelog || '暂无详细发布说明。';
+  $('update-changelog-text').textContent = changelog || pick('暂无详细发布说明。', 'No release notes available.');
   $('update-changelog-box').hidden = !changelog;
 
-  const isExe = res.isExe || res.installType === 'exe';
+  const type = res.installType || (res.isExe ? 'exe' : 'npm');
   const cmdBox = $('update-command-box');
   const doBtn = $('btn-do-upgrade');
   const statusEl = $('update-status');
-  statusEl.hidden = true;
-  statusEl.textContent = '';
-  statusEl.className = 'import-status';
-
-  if (isExe) {
-    cmdBox.hidden = true;
-    doBtn.textContent = '一键就地升级';
-    doBtn.title = '自动下载新版 EXE 并进行热替换';
+  statusEl.hidden = true; statusEl.textContent = ''; statusEl.className = 'status-box';
+  if (type === 'exe') {
+    cmdBox.hidden = true; doBtn.textContent = pick('一键就地升级', 'Upgrade in Place'); doBtn.title = pick('自动下载新版 EXE 并热替换', 'Download and replace executable automatically');
+  } else if (type === 'git') {
+    cmdBox.hidden = false; $('update-command-text').textContent = 'git pull --ff-only';
+    doBtn.textContent = pick('一键 git 更新', 'Git Pull Now'); doBtn.title = pick('在安装目录执行 git pull --ff-only', 'Run git pull --ff-only in install directory');
+    const git = res.git || {};
+    if (git.dirty) {
+      statusEl.hidden = false; statusEl.className = 'status-box error';
+      statusEl.textContent = pick(`工作区有 ${git.dirty} 处未提交改动：先提交或撤销，更新会拒绝执行。`, `Working tree has ${git.dirty} uncommitted change(s); commit or discard before updating.`);
+    } else if (git.branch) {
+      statusEl.hidden = false;
+      statusEl.textContent = pick(`当前分支 ${git.branch}${git.upstream ? ` → ${git.upstream}` : '（没有上游）'}；更新只做快进合并。`, `Branch ${git.branch}${git.upstream ? ` → ${git.upstream}` : ' (no upstream)'}; fast-forward only.`);
+    }
   } else {
-    cmdBox.hidden = false;
-    $('update-command-text').textContent = res.npm?.command || 'npm install -g agent-purge@latest';
-    doBtn.textContent = '一键执行 npm 升级';
-    doBtn.title = '后台自动调用 npm 全局更新';
+    cmdBox.hidden = false; $('update-command-text').textContent = res.npm?.command || 'npm install -g agent-purge@latest';
+    doBtn.textContent = pick('一键 npm 升级', 'Upgrade via npm'); doBtn.title = pick('后台调用 npm 全局更新', 'Run global npm update in background');
   }
   doBtn.disabled = false;
-
   const ghLink = $('update-github-link');
   if (ghLink) ghLink.href = res.htmlUrl || 'https://github.com/ZiChuanLan/agent-purge/releases/latest';
-
   dialog.showModal();
 }
 
@@ -742,111 +1746,100 @@ async function checkAppUpdate(force = false) {
   try {
     const res = await api(`update${force ? '?force=1' : ''}`);
     if (!res.ok) {
-      vb.textContent = `v${res.current || state?.version || '未知'}`;
-      if (force) notify(`检查更新失败：${res.error || '网络异常'}`, 'warn');
+      vb.textContent = `v${res.current || state?.version || pick('未知', 'unknown')}`;
+      if (force) notify(pick(`检查更新失败：${res.error || '网络异常'}`, `Update check failed: ${res.error || 'network error'}`), 'warn');
       return;
     }
     cachedUpdateInfo = res;
     vb.textContent = `v${res.current}`;
+    const behind = Number(res.git?.behind) || 0;
+    const versionAhead = res.latest && res.latest !== res.current;
     if (res.hasUpdate) {
-      vb.className = 'badge good';
-      vb.textContent = `v${res.current} (发现 v${res.latest})`;
-      vb.title = `发现新版本 v${res.latest}，点击查看并一键升级`;
-      if (force) {
-        showUpdateDialog(res);
-      }
+      vb.className = 'version is-new';
+      vb.textContent = versionAhead ? `v${res.current} → v${res.latest}` : pick(`v${res.current} · 上游 ${behind} 个新提交`, `v${res.current} · ${behind} new commit(s)`);
+      vb.title = versionAhead ? pick(`有新版本 v${res.latest}，点击查看并升级`, `New version v${res.latest} available; click to upgrade`) : pick(`上游有 ${behind} 个新提交，点击一键 git 更新`, `${behind} new upstream commit(s); click to pull`);
+      if (force) showUpdateDialog(res);
     } else {
-      vb.className = 'badge';
-      vb.title = `当前版本 v${res.current} 已是最新，点击可重新检查`;
-      if (force) notify(`当前已是最新版本 v${res.current}！（npm 与 GitHub 均已对齐）`, 'good');
+      vb.className = 'version';
+      vb.title = pick(`v${res.current} 已是最新，点击重新检查`, `v${res.current} is up to date; click to re-check`);
+      if (force) notify(pick(`已是最新版本 v${res.current}。`, `Already on latest version v${res.current}.`), 'good');
     }
-  } catch {
-    /* 离线或后台探测失败不阻碍主界面 */
-  }
+  } catch { /* 离线或后台探测失败不阻碍主界面 */ }
 }
 
 $('version-badge')?.addEventListener('click', () => {
-  if (cachedUpdateInfo?.hasUpdate) {
-    showUpdateDialog(cachedUpdateInfo);
-  } else {
-    checkAppUpdate(true);
-  }
+  if (cachedUpdateInfo?.hasUpdate) showUpdateDialog(cachedUpdateInfo);
+  else checkAppUpdate(true);
 });
 $('close-update')?.addEventListener('click', () => $('update-dialog')?.close());
 $('dismiss-update')?.addEventListener('click', () => $('update-dialog')?.close());
 $('copy-update-command')?.addEventListener('click', () => {
   const cmd = $('update-command-text')?.textContent;
-  if (cmd) {
-    navigator.clipboard?.writeText(cmd).then(() => notify('升级命令已复制！', 'good')).catch(() => {});
-  }
+  if (cmd) navigator.clipboard?.writeText(cmd).then(() => notify(pick('升级命令已复制。', 'Upgrade command copied.'), 'good')).catch(() => {});
 });
-
 $('btn-do-upgrade')?.addEventListener('click', async () => {
   if (!cachedUpdateInfo) return;
   const doBtn = $('btn-do-upgrade');
   const statusEl = $('update-status');
-  const isExe = cachedUpdateInfo.isExe || cachedUpdateInfo.installType === 'exe';
-
-  doBtn.disabled = true;
-  doBtn.textContent = isExe ? '正在下载替换...' : '正在执行 npm 升级...';
-  statusEl.hidden = false;
-  statusEl.className = 'import-status';
-  statusEl.textContent = isExe ? '正在下载最新版本可执行文件并进行热替换，请稍候...' : '正在调用 npm 执行全局更新，可能需要十几秒...';
-
+  const type = cachedUpdateInfo.installType || (cachedUpdateInfo.isExe ? 'exe' : 'npm');
+  const busyText = type === 'exe' ? pick('正在下载替换…', 'Downloading…') : type === 'git' ? pick('正在 git pull…', 'Running git pull…') : pick('正在 npm 升级…', 'Updating via npm…');
+  const waitText = type === 'exe' ? pick('正在下载新版并热替换，请稍候…', 'Downloading new version and replacing executable…') : type === 'git' ? pick('正在安装目录执行 git pull --ff-only…', 'Running git pull --ff-only in install directory…') : pick('正在调用 npm 全局更新，可能需要十几秒…', 'Running global npm update; this may take a few seconds…');
+  const retryText = type === 'exe' ? pick('重试就地升级', 'Retry Upgrade') : type === 'git' ? pick('重试 git 更新', 'Retry git pull') : pick('重试 npm 升级', 'Retry npm update');
+  doBtn.disabled = true; doBtn.textContent = busyText;
+  statusEl.hidden = false; statusEl.className = 'status-box'; statusEl.textContent = waitText;
   try {
-    const res = await api('update-upgrade', { type: isExe ? 'exe' : 'npm' });
+    const res = await api('update-upgrade', { type });
     if (res.ok) {
-      statusEl.className = 'import-status success';
-      statusEl.textContent = res.message || '升级成功！';
-      doBtn.textContent = '升级完成';
-      notify(res.message || '升级成功！', 'good');
-      setTimeout(() => {
-        $('update-dialog')?.close();
-        checkAppUpdate(true);
-      }, 2500);
+      statusEl.className = 'status-box success';
+      statusEl.textContent = res.message || pick('升级成功。', 'Upgrade complete.');
+      doBtn.textContent = pick('升级完成', 'Upgraded');
+      notify(res.message || pick('升级成功。', 'Upgrade complete.'), 'good');
+      setTimeout(() => { $('update-dialog')?.close(); checkAppUpdate(true); }, 2500);
     } else {
-      statusEl.className = 'import-status error';
-      statusEl.textContent = res.error || '更新失败';
-      if (res.output) statusEl.textContent += `\n${res.output}`;
-      doBtn.disabled = false;
-      doBtn.textContent = isExe ? '重试就地升级' : '重试 npm 升级';
+      statusEl.className = 'status-box error';
+      statusEl.textContent = `${res.error || pick('更新失败', 'Update failed')}${res.output ? `\n${res.output}` : ''}`;
+      doBtn.disabled = false; doBtn.textContent = retryText;
     }
   } catch (err) {
-    statusEl.className = 'import-status error';
-    statusEl.textContent = err.message || '网络请求异常';
-    doBtn.disabled = false;
-    doBtn.textContent = isExe ? '重试就地升级' : '重试 npm 升级';
+    statusEl.className = 'status-box error';
+    statusEl.textContent = err.message || pick('网络请求异常', 'Network request failed');
+    doBtn.disabled = false; doBtn.textContent = retryText;
   }
 });
+
+/* ---------------- lifecycle ---------------- */
 $('exit-btn')?.addEventListener('click', async () => {
   if (configDirty() || editorDirty()) {
-    if (!confirm('当前有未保存的设置或草稿，确定退出并关闭吗？')) return;
+    if (!confirm(t('exit.confirmUnsaved'))) return;
   }
-  $('connection').textContent = '服务已停止';
-  notify('正在退出本地服务并关闭窗口…', 'muted');
-  try {
-    await fetch('/api/exit', { method: 'POST', keepalive: true });
-  } catch {}
-  setTimeout(() => {
-    window.close();
-  }, 200);
+  document.body.dataset.exiting = '1';
+  setConnection(t('conn.stopped'), 'is-down');
+  notify(t('exit.stopping'), 'muted');
+  try { await fetch('/api/exit', { method: 'POST', keepalive: true }); } catch {}
+  setTimeout(() => window.close(), 200);
 });
-
-// 心跳保活与窗口关闭联动
-setInterval(() => {
-  fetch('/api/heartbeat', { method: 'POST', keepalive: true }).catch(() => {});
-}, 2500);
-
-window.addEventListener('pagehide', () => {
+setInterval(() => { fetch('/api/heartbeat', { method: 'POST', keepalive: true }).catch(() => {}); }, 2500);
+window.addEventListener('pagehide', event => {
+  if (event.persisted) return;
   try {
-    if (navigator.sendBeacon) {
-      navigator.sendBeacon('/api/exit');
-    } else {
-      fetch('/api/exit', { method: 'POST', keepalive: true }).catch(() => {});
-    }
+    const gen = document.querySelector('meta[name="ap-server-gen"]')?.getAttribute('content') ?? '';
+    const target = `/api/leave?gen=${encodeURIComponent(gen)}`;
+    if (navigator.sendBeacon) navigator.sendBeacon(target);
+    else fetch(target, { method: 'POST', keepalive: true }).catch(() => {});
   } catch {}
 });
+window.addEventListener('beforeunload', e => {
+  // 关窗确认只在「关掉这扇桌面窗口」时有意义：终端托管的 web 页面和主动点退出都不拦
+  const wantConfirm = state?.settingsDesktop?.managed === true
+    && state?.settings?.desktop?.confirmOnClose !== false
+    && !document.body.dataset.exiting;
+  if (wantConfirm || configDirty() || editorDirty()) { e.preventDefault(); e.returnValue = ''; }
+});
 
-window.addEventListener('beforeunload', e => { if (configDirty() || editorDirty()) { e.preventDefault(); e.returnValue = ''; } });
-initCustomSelects();
-refresh().then(() => navigate(pageFromHash(), { replace: true, focus: false })).then(() => checkAppUpdate(false)).catch(error => { $('connection').textContent = '本地服务未连接'; notify(`${error.message} 使用右上角“刷新状态”重试。`, 'error'); });
+// 原生窗口宿主（WebView2）关窗前会问这里：WebView2 不会自己跑 beforeunload，
+// 未保存草稿的判断搬到显式入口；要不要弹确认由宿主按设置页的选项决定。
+window.__apDirty = () => configDirty() || editorDirty();
+refresh().then(() => navigate(pageFromHash(), { replace: true, focus: false })).then(() => checkAppUpdate(false)).catch(error => {
+  setConnection(t('conn.disconnected'), 'is-down');
+  notify(t('conn.disconnectedNotice', { error: error.message }), 'error');
+});
